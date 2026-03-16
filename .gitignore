@@ -127,6 +127,10 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+apenv/
+
+# Dataset (large binary files — download separately)
+Data/
 
 # Spyder project settings
 .spyderproject
