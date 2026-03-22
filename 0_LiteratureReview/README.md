@@ -91,3 +91,39 @@ Transformer architectures achieved higher accuracy on very small objects (e.g., 
 
 **Relation to the Project:**  
 Provides a current benchmark comparison of YOLO and Transformer-based object detectors on maritime datasets similar to LaRS.
+
+---
+
+## Source 6: YOLO: Unified, Real-Time Object Detection
+
+**Link:** https://arxiv.org/abs/1506.02640  
+
+**Objective:**  
+To introduce a unified, real-time object detection framework that treats detection as a single regression problem from image pixels to bounding boxes and class probabilities.
+
+**Methods:**  
+YOLO (You Only Look Once) divides the image into a grid and directly predicts bounding boxes and class probabilities in a single forward pass using a convolutional neural network.
+
+**Outcomes:**  
+Achieved real-time performance (up to ~45 FPS in the original version) with competitive accuracy. However, it initially struggled with small object detection and precise localization.
+
+**Relation to the Project:**  
+Provides the conceptual foundation for all YOLO variants used in maritime object detection, especially relevant for real-time navigation systems.
+
+---
+
+## Source 7: Faster R-CNN: Towards Real-Time Object Detection with Region Proposal Networks
+
+**Link:** https://arxiv.org/abs/1506.01497  
+
+**Objective:**  
+To improve the speed and efficiency of region-based object detection by integrating region proposal generation into the neural network.
+
+**Methods:**  
+Faster R-CNN introduces a Region Proposal Network (RPN) that shares convolutional features with the detection network, enabling nearly cost-free region proposals.
+
+**Outcomes:**  
+Significantly improved detection accuracy compared to earlier methods (e.g., Fast R-CNN), while reducing computation time. Became a standard baseline for high-accuracy object detection.
+
+**Relation to the Project:**  
+Serves as a key baseline for region-based detectors, useful for comparison with YOLO and Transformer-based models in maritime environments.

@@ -19,8 +19,8 @@ from collections import defaultdict
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-RAW_ANN  = Path("../Data/lars_v1")
-RAW_IMG  = Path("../Data/lars_v1-2")
+RAW_ANN  = Path("../Data/lars_v1.0.0_annotations") # Adjust accordingly
+RAW_IMG  = Path("../Data/lars_v1.0.0_images") # Adjust accordingly
 OUT_ROOT = Path("../Data/lars_processed")
 
 # ---------------------------------------------------------------------------
@@ -61,7 +61,7 @@ for ann in train_img_anns:
     scenes[scene].append(ann)
 
 scene_names = sorted(scenes.keys())
-random.seed(42)
+random.seed(4)
 random.shuffle(scene_names)
 
 split_idx    = int(len(scene_names) * 0.8)
