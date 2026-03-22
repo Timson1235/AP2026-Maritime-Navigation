@@ -21,4 +21,4 @@
 [Explain the practical relevance and business impact of each chosen evaluation metric. How do these metrics translate to real-world performance and decision-making? What do the metric values mean in the context of your specific problem domain?]
 
 ## Next Steps
-This baseline model serves as a reference point for evaluating more sophisticated models in the [Model Definition and Evaluation](../3_Model/README.md) phase.
+This baseline model serves as a reference point for evaluating more sophisticated models in the [Model Definition and Evaluation](../4_Model/README.md) phase.
