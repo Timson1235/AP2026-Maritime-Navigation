@@ -1,10 +1,17 @@
 """
 Reorganises the raw LARS splits into a clean train/val/test structure:
 
-  new train     <- 80% of original train (scene-level split)
-  new val       <- 20% of original train (scene-level split)
-  test          <- original val  (has panoptic / bbox labels)
-  test_unused   <- original test (no bbox labels)
+  new train     <- ~86% of original LARS train (stratified scene-level split)
+  new val       <- ~14% of original LARS train (stratified scene-level split)
+  test          <- original LARS val  (has panoptic / bbox labels)
+  test_unused   <- original LARS test (no bbox labels)
+
+The val/test sizes are intentionally kept comparable (~10% each of the
+overall labelled pool), giving a rough 80/10/10 distribution.
+
+Stratification key per scene: scene_type x lighting x primary_thing_category
+Scenes (image sequences) are kept intact — no frame from the same sequence
+appears in more than one split.
 
 Output is written to Data/lars_processed/. Original data is not modified.
 """
@@ -14,13 +21,13 @@ import re
 import shutil
 import random
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-RAW_ANN  = Path("../Data/lars_v1.0.0_annotations") # Adjust accordingly
-RAW_IMG  = Path("../Data/lars_v1.0.0_images") # Adjust accordingly
+RAW_ANN  = Path("../Data/lars_v1.0.0_annotations")
+RAW_IMG  = Path("../Data/lars_v1.0.0_images")
 OUT_ROOT = Path("../Data/lars_processed")
 
 # ---------------------------------------------------------------------------
@@ -52,41 +59,85 @@ thing_categories = [c for c in train_pan["categories"] if c["isthing"]]
 thing_cat_ids    = {c["id"] for c in thing_categories}
 print("Detection categories:", [c["name"] for c in thing_categories])
 
+# Panoptic segment lookup: jpg filename -> segments_info
+pan_segs_lookup = {
+    ann["file_name"].replace(".png", ".jpg"): ann["segments_info"]
+    for ann in train_pan["annotations"]
+}
+
 # ---------------------------------------------------------------------------
-# Scene-level 80/20 split of original train
+# Group images into scenes (sequence-level)
 # ---------------------------------------------------------------------------
-scenes = defaultdict(list)
+scenes: dict[str, list] = defaultdict(list)
 for ann in train_img_anns:
     scene = re.sub(r"_\d{5}\.jpg$", "", ann["file_name"])
     scenes[scene].append(ann)
 
-scene_names = sorted(scenes.keys())
-random.seed(4)
-random.shuffle(scene_names)
+# ---------------------------------------------------------------------------
+# Per-scene stratification key: scene_type x lighting x primary_thing
+# ---------------------------------------------------------------------------
+def dominant(values):
+    vals = [v for v in values if v is not None]
+    return Counter(vals).most_common(1)[0][0] if vals else "unknown"
 
-split_idx    = int(len(scene_names) * 0.8)
-train_scenes = set(scene_names[:split_idx])
-val_scenes   = set(scene_names[split_idx:])
+def primary_thing(scene_anns):
+    cat_name = {c["id"]: c["name"] for c in thing_categories}
+    counts = Counter(
+        cat_name[seg["category_id"]]
+        for ann in scene_anns
+        for seg in pan_segs_lookup.get(ann["file_name"], [])
+        if seg["category_id"] in thing_cat_ids
+    )
+    return counts.most_common(1)[0][0] if counts else "none"
 
-train_anns = [ann for scene in train_scenes for ann in scenes[scene]]
-val_anns   = [ann for scene in val_scenes   for ann in scenes[scene]]
-
-print(f"Scenes  — train: {len(train_scenes)}, val: {len(val_scenes)}")
-print(f"Images  — train: {len(train_anns)}, val: {len(val_anns)}")
+scene_strata: dict[str, str] = {}
+for scene, anns in scenes.items():
+    scene_type = dominant(a["labels"]["scene_type"] for a in anns)
+    lighting   = dominant(a["labels"]["lighting"]   for a in anns)
+    scene_strata[scene] = f"{scene_type}|{lighting}|{primary_thing(anns)}"
 
 # ---------------------------------------------------------------------------
-# Helper
+# Stratified ~90/10 scene-level split
+# Val target ~14% of LARS train → comparable in size to the fixed test set
+# ---------------------------------------------------------------------------
+strata_groups: dict[str, list] = defaultdict(list)
+for scene, key in scene_strata.items():
+    strata_groups[key].append(scene)
+
+random.seed(4)
+
+VAL_RATIO = 0.14  # ~14% of LARS train → val comparable in size to the fixed test set
+
+train_scenes, val_scenes = [], []
+
+for key, group in sorted(strata_groups.items()):
+    random.shuffle(group)
+    n_val = max(1, round(len(group) * VAL_RATIO)) if len(group) >= 2 else 0
+    train_scenes.extend(group[n_val:])
+    val_scenes.extend(group[:n_val])
+
+new_train_anns = [ann for s in train_scenes for ann in scenes[s]]
+new_val_anns   = [ann for s in val_scenes   for ann in scenes[s]]
+
+total_labelled = len(new_train_anns) + len(new_val_anns) + len(val_img_anns)
+print(f"\nScenes  — train: {len(train_scenes)}, val: {len(val_scenes)}")
+print(f"Images  — train: {len(new_train_anns)} ({len(new_train_anns)/total_labelled:.1%}), "
+      f"val: {len(new_val_anns)} ({len(new_val_anns)/total_labelled:.1%}), "
+      f"test: {len(val_img_anns)} ({len(val_img_anns)/total_labelled:.1%})")
+
+# ---------------------------------------------------------------------------
+# Helper: write COCO detection JSON and copy images
 # ---------------------------------------------------------------------------
 def build_coco_detection(img_anns, pan_json, src_img_dir, out_dir):
     """Copy images and write a COCO detection JSON (thing bboxes only)."""
-    img_filenames    = {ann["file_name"] for ann in img_anns}
+    img_filenames     = {ann["file_name"] for ann in img_anns}
     fname_to_imgentry = {img["file_name"]: img for img in pan_json["images"]}
 
     coco_images, coco_annotations = [], []
     ann_id = 1
 
     for pan_ann in pan_json["annotations"]:
-        jpg_name = pan_ann["file_name"].replace(".png", ".jpg")
+        jpg_name  = pan_ann["file_name"].replace(".png", ".jpg")
         if jpg_name not in img_filenames:
             continue
         img_entry = fname_to_imgentry.get(jpg_name)
@@ -101,7 +152,7 @@ def build_coco_detection(img_anns, pan_json, src_img_dir, out_dir):
                 "id":          ann_id,
                 "image_id":    img_entry["id"],
                 "category_id": seg["category_id"],
-                "bbox":        seg["bbox"],  # [x, y, w, h]
+                "bbox":        seg["bbox"],
                 "area":        seg["area"],
                 "iscrowd":     seg["iscrowd"],
             })
@@ -124,9 +175,9 @@ def build_coco_detection(img_anns, pan_json, src_img_dir, out_dir):
 # ---------------------------------------------------------------------------
 print("\nBuilding processed dataset...")
 
-build_coco_detection(train_anns,  train_pan, RAW_IMG / "train" / "images", OUT_ROOT / "train")
-build_coco_detection(val_anns,    train_pan, RAW_IMG / "train" / "images", OUT_ROOT / "val")
-build_coco_detection(val_img_anns, val_pan,  RAW_IMG / "val"   / "images", OUT_ROOT / "test")
+build_coco_detection(new_train_anns, train_pan, RAW_IMG / "train" / "images", OUT_ROOT / "train")
+build_coco_detection(new_val_anns,   train_pan, RAW_IMG / "train" / "images", OUT_ROOT / "val")
+build_coco_detection(val_img_anns,   val_pan,   RAW_IMG / "val"   / "images", OUT_ROOT / "test")
 
 # test_unused — no bbox labels, just images + image-level annotations
 with open(OUT_ROOT / "test_unused" / "image_annotations.json", "w") as f:
