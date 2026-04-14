@@ -23,8 +23,8 @@ from sklearn.model_selection import train_test_split
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-RAW_ANN  = Path("../Data/lars_v1")
-RAW_IMG  = Path("../Data/lars_v1-2")
+RAW_ANN  = Path("../Data/lars_v1.0.0_annotations")
+RAW_IMG  = Path("../Data/lars_v1.0.0_images")
 OUT_ROOT = Path("../Data/lars_processed")
 
 # ---------------------------------------------------------------------------
