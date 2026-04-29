@@ -130,7 +130,20 @@ venv.bak/
 apenv/
 
 # Dataset (large binary files — download separately)
-Data/
+# Ignore everything inside Data/ except lars_relabeled annotations
+Data/*
+!Data/lars_relabeled
+Data/lars_relabeled/*
+!Data/lars_relabeled/*.json
+!Data/lars_relabeled/train
+Data/lars_relabeled/train/*
+!Data/lars_relabeled/train/*.json
+!Data/lars_relabeled/valid
+Data/lars_relabeled/valid/*
+!Data/lars_relabeled/valid/*.json
+!Data/lars_relabeled/test
+Data/lars_relabeled/test/*
+!Data/lars_relabeled/test/*.json
 
 # Spyder project settings
 .spyderproject
