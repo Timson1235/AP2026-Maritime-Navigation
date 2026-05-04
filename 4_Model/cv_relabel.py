@@ -69,12 +69,13 @@ TRIAL004 = dict(
 # ---------------------------------------------------------------------------
 # Detection thresholds  (match noisy_label_eval.ipynb exactly)
 # ---------------------------------------------------------------------------
-IOU_THRESH           = 0.5
-VIZ_THRESHOLD        = 0.1     # min pred conf to consider at all
-FP_CONF_THRESHOLD    = 0.55    # unmatched pred > this → likely missing label
-FN_CONF_THRESHOLD    = 0.05    # FN: max conf inside box < this → ghost
-MERGE_CONF_THRESHOLD = 0.5     # min conf to count as "real object inside" for merge
-MIN_GHOST_AREA       = 2000    # skip ghost check for GT boxes smaller than this (px²)
+IOU_THRESH              = 0.5
+VIZ_THRESHOLD           = 0.1     # min pred conf to consider at all
+FP_CONF_THRESHOLD       = 0.55    # unmatched pred > this → likely missing label
+FN_CONF_THRESHOLD       = 0.05    # FN: max conf inside box < this → ghost
+MERGE_CONF_THRESHOLD    = 0.5     # min conf to count as "real object inside" for merge
+MIN_GHOST_AREA          = 2000    # skip ghost check for GT boxes smaller than this (px²)
+RESIZE_COVERAGE_THRESH  = 0.5     # FP covers ≥ this fraction of a GT box → resize, not new label
 
 K_FOLDS  = 4
 SEED     = 4
@@ -277,6 +278,15 @@ def _iou(a, b) -> float:
     return inter / union if union > 0 else 0.0
 
 
+def _gt_coverage(pred_box, gt_box) -> float:
+    """Fraction of gt_box area covered by pred_box (asymmetric — not IoU)."""
+    xi1 = max(pred_box[0], gt_box[0]); yi1 = max(pred_box[1], gt_box[1])
+    xi2 = min(pred_box[2], gt_box[2]); yi2 = min(pred_box[3], gt_box[3])
+    inter = max(0.0, xi2 - xi1) * max(0.0, yi2 - yi1)
+    gt_area = (gt_box[2] - gt_box[0]) * (gt_box[3] - gt_box[1])
+    return inter / gt_area if gt_area > 0 else 0.0
+
+
 def _centers_inside(gt_box, vis_boxes, vis_scores,
                     excl_idx=None, min_conf: float = 0.0) -> list[float]:
     result = []
@@ -370,12 +380,27 @@ def relabel_images(
                 matched_gt[best_gi]  = pi
                 matched_pred[pi]     = best_gi
 
-        # ── Step 3: Missing labels — high-conf unmatched predictions ──────────
-        missing_preds = []
+        # ── Step 3: Split high-conf FPs into resize vs. new label ────────────
+        # pb_s is sorted by confidence descending, so the first FP targeting
+        # a given GT index is always the highest-confidence one.
+        resize_preds    = []   # (pred_box, score, cls_idx, gi) — expand existing GT
+        new_label_preds = []   # (pred_box, score, cls_idx)     — add new annotation
+        resize_gt_seen  = set()
+
         for pi in range(len(pb_s)):
             if pi not in matched_pred and ps_s[pi] > FP_CONF_THRESHOLD:
                 pred_cls_idx = int(vis_cids[order[pi]])
-                missing_preds.append((pb_s[pi], float(ps_s[pi]), pred_cls_idx))
+                b = pb_s[pi]; s = float(ps_s[pi])
+                best_cov, best_gi = RESIZE_COVERAGE_THRESH, -1
+                for gi in range(len(gt_boxes)):
+                    cov = _gt_coverage(b, gt_boxes[gi])
+                    if cov > best_cov:
+                        best_cov, best_gi = cov, gi
+                if best_gi >= 0 and best_gi not in resize_gt_seen:
+                    resize_preds.append((b, s, pred_cls_idx, best_gi))
+                    resize_gt_seen.add(best_gi)
+                else:
+                    new_label_preds.append((b, s, pred_cls_idx))
 
         # ── Step 4: Bad GT boxes ──────────────────────────────────────────────
         bad_gt: dict[int, str] = {}   # gi → "ghost" | "merged"
@@ -418,9 +443,10 @@ def relabel_images(
                     stats["removed_ghost"] += 1
 
         # ── Build cleaned annotation list ─────────────────────────────────────
-        image_changed = bool(bad_gt) or bool(missing_preds)
+        resize_by_gi  = {gi: (b, s) for b, s, _, gi in resize_preds}
+        image_changed = bool(bad_gt) or bool(resize_preds) or bool(new_label_preds)
 
-        kept, removed_record = [], []
+        kept, removed_record, resized_record = [], [], []
         for gi, ann in enumerate(orig_anns):
             if gi in bad_gt:
                 removed_record.append({
@@ -428,6 +454,21 @@ def relabel_images(
                     "relabel_action": "removed",
                     "relabel_reason": bad_gt[gi],
                 })
+            elif gi in resize_by_gi:
+                pred_box, score = resize_by_gi[gi]
+                x1, y1, x2, y2 = pred_box
+                w, h = float(x2 - x1), float(y2 - y1)
+                resized_ann = {
+                    **ann,
+                    "bbox":               [float(x1), float(y1), w, h],
+                    "area":               float(w * h),
+                    "relabel_action":     "resized",
+                    "relabel_conf":       score,
+                    "relabel_orig_bbox":  ann["bbox"],
+                }
+                kept.append(resized_ann)
+                resized_record.append(resized_ann)
+                stats["resized"] += 1
             else:
                 kept_ann = {**ann}
                 if image_changed:
@@ -436,7 +477,7 @@ def relabel_images(
         stats["kept"] += len(kept)
 
         added, added_record = [], []
-        for box_xyxy, score, pred_cls_idx in missing_preds:
+        for box_xyxy, score, pred_cls_idx in new_label_preds:
             x1, y1, x2, y2 = box_xyxy
             w, h = float(x2 - x1), float(y2 - y1)
             if w <= 0 or h <= 0:
@@ -465,6 +506,7 @@ def relabel_images(
                 "file_name": fname,
                 "split":     split,
                 "removed":   removed_record,
+                "resized":   resized_record,
                 "added":     added_record,
             }
 
@@ -487,10 +529,12 @@ def write_relabeled_output(
 
     Annotation 'relabel_action' field:
       "kept"    — original box on an image that had at least one change
+      "resized" — original box expanded to model's predicted extent
+                  (also has 'relabel_conf' and 'relabel_orig_bbox')
       "added"   — new box inserted by the model (also has 'relabel_conf')
       (absent)  — original box on an image the model made no changes to
 
-    provenance.json logs every removed / added annotation per image.
+    provenance.json logs every removed / resized / added annotation per image.
     """
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -527,10 +571,11 @@ def write_relabeled_output(
         json.dump({str(k): v for k, v in all_provenance.items()}, f, indent=2)
 
     n_changed = len(all_provenance)
-    n_removed = sum(len(v["removed"]) for v in all_provenance.values())
-    n_added   = sum(len(v["added"])   for v in all_provenance.values())
+    n_removed = sum(len(v["removed"])          for v in all_provenance.values())
+    n_resized = sum(len(v.get("resized", [])) for v in all_provenance.values())
+    n_added   = sum(len(v["added"])            for v in all_provenance.values())
     log.info(f"[output] provenance.json: {n_changed} images changed "
-             f"({n_removed} removed, {n_added} added) → {prov_path}")
+             f"({n_removed} removed, {n_resized} resized, {n_added} added) → {prov_path}")
 
 
 # ===========================================================================
@@ -711,18 +756,18 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 6. Final summary
     # ------------------------------------------------------------------
-    total_removed = sum(len(v["removed"]) for v in all_provenance.values())
-    total_added   = sum(len(v["added"])   for v in all_provenance.values())
+    total_removed = sum(len(v["removed"])          for v in all_provenance.values())
+    total_resized = sum(len(v.get("resized", [])) for v in all_provenance.values())
+    total_added   = sum(len(v["added"])            for v in all_provenance.values())
     total_changed = len(all_provenance)
 
     log.info("=" * 60)
     log.info("Done.")
-    log.info(f"  Images processed : {len(all_cleaned_anns)}")
-    log.info(f"  Images changed   : {total_changed}")
-    log.info(f"  Annotations removed : {total_removed}  "
-             f"(ghost + merged)")
-    log.info(f"  Annotations added   : {total_added}  "
-             f"(missing labels)")
+    log.info(f"  Images processed    : {len(all_cleaned_anns)}")
+    log.info(f"  Images changed      : {total_changed}")
+    log.info(f"  Annotations removed : {total_removed}  (ghost + merged)")
+    log.info(f"  Annotations resized : {total_resized}  (GT box too small)")
+    log.info(f"  Annotations added   : {total_added}  (missing labels)")
     log.info(f"  Relabeled dataset   : {out_root}")
     log.info("=" * 60)
 

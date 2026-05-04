@@ -6,6 +6,12 @@ Usage:
     python train_rfdetr.py --output-dir ../runs/rfdetr_v2 --epochs 80
     python train_rfdetr.py --resume                  # resume from latest checkpoint
 
+    # MacBook Pro (MPS auto-detected by PyTorch Lightning):
+    python train_rfdetr.py --mac
+
+    # Force CPU (slow, for testing):
+    python train_rfdetr.py --device cpu
+
 Logs training progress to both console and <output-dir>/training.log.
 Checkpoints and metrics.csv are saved to <output-dir>.
 """
@@ -65,6 +71,14 @@ def parse_args():
                    help="Resume from the latest checkpoint in --output-dir")
     p.add_argument("--no-early-stopping", action="store_true",
                    help="Disable early stopping and always train for --epochs epochs")
+    p.add_argument("--mac", action="store_true",
+                   help="Optimised defaults for MacBook Pro: resolution=560, batch-size=2, "
+                        "num-workers=0. MPS is auto-detected by PyTorch Lightning.")
+    p.add_argument("--device", default=None,
+                   help="Force a specific device string, e.g. 'cpu'. "
+                        "Leave unset to let PyTorch Lightning auto-select (CUDA / MPS / CPU).")
+    p.add_argument("--num-workers", type=int, default=None,
+                   help="DataLoader worker processes (default: 2; use 0 on Mac to avoid spawn issues)")
     return p.parse_args()
 
 
@@ -105,6 +119,19 @@ def main():
     logger.info("RF-DETR  —  LARS Maritime Dataset Fine-tuning")
     logger.info("=" * 60)
 
+    # Apply --mac preset before anything else
+    if args.mac:
+        if args.resolution == DEFAULTS["resolution"]:
+            args.resolution = 560
+        if args.batch_size == DEFAULTS["batch_size"]:
+            args.batch_size = 2
+        if args.num_workers is None:
+            args.num_workers = 0
+
+    # Fill num_workers default for non-Mac runs
+    if args.num_workers is None:
+        args.num_workers = 2
+
     # Reproducibility
     random.seed(4)
     np.random.seed(4)
@@ -112,6 +139,8 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(4)
         logger.info(f"Device        : CUDA — {torch.cuda.get_device_name(0)}")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        logger.info("Device        : MPS (Apple Silicon)")
     else:
         logger.info("Device        : CPU (training will be slow)")
 
@@ -127,6 +156,7 @@ def main():
     # Log hyperparameters
     eff_batch = args.batch_size * DEFAULTS["grad_accum_steps"]
     logger.info("Hyperparameters:")
+    logger.info(f"  num_workers         = {args.num_workers}")
     logger.info(f"  epochs              = {args.epochs}")
     logger.info(f"  batch_size          = {args.batch_size}")
     logger.info(f"  grad_accum_steps    = {DEFAULTS['grad_accum_steps']}")
@@ -164,7 +194,7 @@ def main():
 
     logger.info("Starting training …")
     t_train_start = time.time()
-    model.train(
+    train_kwargs = dict(
         dataset_dir              = str(DATA_ROOT),
         epochs                   = args.epochs,
         batch_size               = args.batch_size,
@@ -181,7 +211,12 @@ def main():
         early_stopping_patience  = DEFAULTS["early_stopping_patience"],
         early_stopping_min_delta = DEFAULTS["early_stopping_min_delta"],
         early_stopping_use_ema   = False,
+        num_workers              = args.num_workers,
     )
+    if args.device:
+        train_kwargs["device"] = args.device
+
+    model.train(**train_kwargs)
     t_train_elapsed = time.time() - t_train_start
 
     # ── Post-training summary ──────────────────────────────────────────────
