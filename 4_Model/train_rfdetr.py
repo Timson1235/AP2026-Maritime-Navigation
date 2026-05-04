@@ -14,6 +14,7 @@ import argparse
 import logging
 import random
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -162,6 +163,7 @@ def main():
     model = RFDETRBase(resolution=args.resolution)
 
     logger.info("Starting training …")
+    t_train_start = time.time()
     model.train(
         dataset_dir              = str(DATA_ROOT),
         epochs                   = args.epochs,
@@ -180,9 +182,13 @@ def main():
         early_stopping_min_delta = DEFAULTS["early_stopping_min_delta"],
         early_stopping_use_ema   = False,
     )
+    t_train_elapsed = time.time() - t_train_start
 
     # ── Post-training summary ──────────────────────────────────────────────
+    h, rem = divmod(int(t_train_elapsed), 3600)
+    m, s   = divmod(rem, 60)
     logger.info("Training complete.")
+    logger.info(f"Training time     : {h:02d}:{m:02d}:{s:02d}  ({t_train_elapsed/60:.1f} min)")
     logger.info(f"Artefacts saved to: {output_dir}")
 
     for ckpt in sorted(output_dir.glob("checkpoint_best*.pth")):

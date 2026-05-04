@@ -7,11 +7,15 @@ scikit-learn>=1.3
 Pillow>=10.0
 
 # Deep learning
-torch>=2.0
-torchvision>=0.15
-rfdetr>=1.6
+# Pin to cu124 — newer builds (cu130+) require a driver not available on this machine
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+rfdetr[train,loggers]>=1.6
 supervision>=0.25
 albumentations>=1.3
+
+# Hyperparameter search
+optuna>=4.0
 
 # Jupyter
 jupyter>=1.0
