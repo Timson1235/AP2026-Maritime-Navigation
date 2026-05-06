@@ -6,6 +6,9 @@ Usage:
     python train_rfdetr.py --output-dir ../runs/rfdetr_v2 --epochs 80
     python train_rfdetr.py --resume                  # resume from latest checkpoint
 
+    # Train the large model on relabeled data:
+    python train_rfdetr.py --model large --data-root ../Data/lars_processed
+
     # MacBook Pro (MPS auto-detected by PyTorch Lightning):
     python train_rfdetr.py --mac
 
@@ -79,6 +82,11 @@ def parse_args():
                         "Leave unset to let PyTorch Lightning auto-select (CUDA / MPS / CPU).")
     p.add_argument("--num-workers", type=int, default=None,
                    help="DataLoader worker processes (default: 2; use 0 on Mac to avoid spawn issues)")
+    p.add_argument("--model", choices=["base", "large"], default="base",
+                   help="RF-DETR variant: 'base' (default) or 'large' (higher accuracy, more VRAM)")
+    p.add_argument("--data-root", default=None,
+                   help="Override dataset root (default: Data/lars_processed). "
+                        "Pass e.g. ../Data/lars_processed to use a different split.")
     return p.parse_args()
 
 
@@ -113,6 +121,12 @@ def setup_logging(output_dir: Path) -> logging.Logger:
 def main():
     args       = parse_args()
     output_dir = Path(args.output_dir)
+
+    global DATA_ROOT
+    if args.data_root is not None:
+        DATA_ROOT = (Path(args.data_root) if Path(args.data_root).is_absolute()
+                     else (_HERE / ".." / args.data_root).resolve())
+
     logger     = setup_logging(output_dir)
 
     logger.info("=" * 60)
@@ -150,6 +164,7 @@ def main():
         logger.error("Run  2_DataPreprocessing/datasplit.py  first.")
         sys.exit(1)
 
+    logger.info(f"Model variant : RF-DETR{args.model.capitalize()}")
     logger.info(f"Dataset root  : {DATA_ROOT.resolve()}")
     logger.info(f"Output dir    : {output_dir.resolve()}")
 
@@ -188,9 +203,12 @@ def main():
             logger.warning("--resume set but no checkpoint found; starting from COCO pretrained weights")
 
     # Lazy import — fails fast on missing deps before training starts
-    from rfdetr import RFDETRBase
-
-    model = RFDETRBase(resolution=args.resolution)
+    if args.model == "large":
+        from rfdetr import RFDETRLarge
+        model = RFDETRLarge(resolution=args.resolution)
+    else:
+        from rfdetr import RFDETRBase
+        model = RFDETRBase(resolution=args.resolution)
 
     logger.info("Starting training …")
     t_train_start = time.time()

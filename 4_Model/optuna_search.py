@@ -380,9 +380,10 @@ def objective(
     grad_clip_max_norm = trial.suggest_float("grad_clip_max_norm", 0.05, 0.50, log=True)
     # 560 is the minimum — lower resolutions hurt small object detection
     # (buoys, swimmers, paddle boards at range) and the model is already large
-    res_choices  = [560] if args.smoke else [560, 616, 672, 728, 784]
-    resolution   = trial.suggest_categorical("resolution", res_choices)
-    batch_size   = trial.suggest_categorical("batch_size",  [16] if args.smoke else [8,12,16,24])
+    res_choices    = [560] if args.smoke else [560, 616, 672, 728, 784]
+    resolution     = trial.suggest_categorical("resolution",    res_choices)
+    batch_size     = trial.suggest_categorical("batch_size",    [16] if args.smoke else [8, 12, 16, 24])
+    model_variant  = trial.suggest_categorical("model_variant", ["base"] if args.smoke else ["base", "large"])
 
     # ── Sample augmentation ───────────────────────────────────────────────────
     # 2,102 training images is small — up to 3 copies (4× dataset) is reasonable
@@ -393,7 +394,7 @@ def objective(
     logger.info(f"Trial {trial.number:3d}  →  {trial_dir.name}")
     logger.info(f"  lr={lr:.2e}  lr_encoder={lr_encoder:.2e}  wd={weight_decay:.2e}")
     logger.info(f"  resolution={resolution}  batch={batch_size}  "
-                f"grad_clip={grad_clip_max_norm:.3f}")
+                f"grad_clip={grad_clip_max_norm:.3f}  model={model_variant}")
     logger.info(f"  aug_copies={aug_copies}")
     logger.info("=" * 64)
 
@@ -423,9 +424,12 @@ def objective(
         trial.set_user_attr("aug_time_s", 0.0)
 
     # ── Train ─────────────────────────────────────────────────────────────────
-    from rfdetr import RFDETRBase
-
-    model = RFDETRBase(resolution=resolution)
+    if model_variant == "large":
+        from rfdetr import RFDETRLarge
+        model = RFDETRLarge(resolution=resolution)
+    else:
+        from rfdetr import RFDETRBase
+        model = RFDETRBase(resolution=resolution)
 
     # Only save a checkpoint at the very end to save time / disk
     t_train_start = time.time()
