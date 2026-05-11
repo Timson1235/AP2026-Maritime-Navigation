@@ -42,11 +42,11 @@ DEFAULTS = dict(
     epochs               = 100,
     batch_size           = 4,
     grad_accum_steps     = 4,       # effective batch = batch_size × grad_accum_steps = 16
-    lr                   = 1e-4,
-    lr_encoder           = 1e-5,    # backbone — 10× lower to preserve pretrained features
-    resolution           = 728,
-    weight_decay         = 1e-4,
-    grad_clip_max_norm   = 0.1,
+    lr                   = 1.21e-4, # trial_004 best HP
+    lr_encoder           = 2.81e-5, # trial_004 best HP
+    resolution           = 768,     # trial_004 used 784; large model needs multiple of 32 → 768
+    weight_decay         = 1.81e-5, # trial_004 best HP
+    grad_clip_max_norm   = 0.083,   # trial_004 best HP
     checkpoint_interval  = 5,
     early_stopping_patience  = 10,
     early_stopping_min_delta = 0.001,
@@ -58,7 +58,7 @@ DEFAULTS = dict(
 # ---------------------------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser(description="Train RF-DETR on the LARS maritime dataset")
-    p.add_argument("--output-dir", default=str(_HERE / "../runs/rfdetr"),
+    p.add_argument("--output-dir", default=str(_HERE / "../runs/rfdetr/baseline"),
                    help="Directory for checkpoints, metrics.csv, and training.log")
     p.add_argument("--epochs",     type=int,   default=DEFAULTS["epochs"])
     p.add_argument("--batch-size", type=int,   default=DEFAULTS["batch_size"],
@@ -68,8 +68,8 @@ def parse_args():
     p.add_argument("--lr-encoder", type=float, default=DEFAULTS["lr_encoder"],
                    help="Backbone learning rate (keep ≤ 1/10 of --lr)")
     p.add_argument("--resolution", type=int,   default=DEFAULTS["resolution"],
-                   choices=[448, 504, 560, 616, 672, 728, 784],
-                   help="Input resolution (must be a multiple of 56)")
+                   choices=[448, 504, 560, 616, 672, 728, 768, 784, 800],
+                   help="Input resolution. Base model: multiple of 56. Large model: multiple of 32 (e.g. 768, 800)")
     p.add_argument("--resume",     action="store_true",
                    help="Resume from the latest checkpoint in --output-dir")
     p.add_argument("--no-early-stopping", action="store_true",
@@ -82,8 +82,8 @@ def parse_args():
                         "Leave unset to let PyTorch Lightning auto-select (CUDA / MPS / CPU).")
     p.add_argument("--num-workers", type=int, default=None,
                    help="DataLoader worker processes (default: 2; use 0 on Mac to avoid spawn issues)")
-    p.add_argument("--model", choices=["base", "large"], default="base",
-                   help="RF-DETR variant: 'base' (default) or 'large' (higher accuracy, more VRAM)")
+    p.add_argument("--model", choices=["base", "large"], default="large",
+                   help="RF-DETR variant: 'base' or 'large' (default, higher accuracy)")
     p.add_argument("--data-root", default=None,
                    help="Override dataset root (default: Data/lars_processed). "
                         "Pass e.g. ../Data/lars_processed to use a different split.")

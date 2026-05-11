@@ -11,6 +11,7 @@ Pillow>=10.0
 torch==2.6.0+cu124
 torchvision==0.21.0+cu124
 rfdetr[train,loggers]>=1.6
+ultralytics>=8.0
 supervision>=0.25
 albumentations>=1.3
 

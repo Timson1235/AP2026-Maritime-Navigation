@@ -5,7 +5,7 @@ Run RF-DETR inference on a dataset split and write COCO results JSON.
 
 Usage
 -----
-    python export_predictions.py --checkpoint ../runs/optuna/trial_010/checkpoint_best_total.pth
+    python export_predictions_rfdetr.py --checkpoint ../runs/rfdetr/optuna_relabeled_lb/trial_004/checkpoint_best_total.pth
     python export_predictions.py --checkpoint <path> --split test --threshold 0.2
     python export_predictions.py --checkpoint <path> --split val --out my_preds.json
 
