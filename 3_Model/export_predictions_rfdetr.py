@@ -38,8 +38,8 @@ def parse_args():
     p.add_argument("--threshold", type=float, default=0.0,
                    help="Confidence threshold — keep predictions above this value "
                         "(default: 0.0, keep all; the evaluation notebook re-filters)")
-    p.add_argument("--resolution", type=int, default=728,
-                   help="Model input resolution (must match training, default: 728)")
+    p.add_argument("--resolution", type=int, default=784,
+                   help="Model input resolution (must match training; trial_004 was trained at 784)")
     p.add_argument("--out", default=None,
                    help="Output JSON path. Defaults to <checkpoint_dir>/predictions_<split>.json")
     return p.parse_args()

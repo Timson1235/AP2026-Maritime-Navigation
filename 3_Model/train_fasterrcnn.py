@@ -52,6 +52,9 @@ DEFAULTS = dict(
     early_stopping_patience  = 10,
     early_stopping_min_delta = 0.001,
     num_workers              = 4,
+    # Tuned anchors from fasterrcnn_anchor_analysis.ipynb (coverage 66.6% vs 45.6% default)
+    anchor_sizes             = (8, 24, 56, 96, 112, 176, 288, 320, 624),
+    aspect_ratios            = (0.5, 0.75, 1.25),
 )
 
 
@@ -115,7 +118,8 @@ def collate_fn(batch):
 # Model builder
 # ---------------------------------------------------------------------------
 
-def build_model(model_name: str, num_classes: int) -> torch.nn.Module:
+def build_model(model_name: str, num_classes: int,
+                anchor_sizes=None, aspect_ratios=None) -> torch.nn.Module:
     from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 
     if model_name == "large":
@@ -138,6 +142,23 @@ def build_model(model_name: str, num_classes: int) -> torch.nn.Module:
         )
         in_features = model.roi_heads.box_predictor.cls_score.in_features
         model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+
+    if anchor_sizes is not None and aspect_ratios is not None:
+        from torchvision.models.detection.rpn import AnchorGenerator
+        n_levels = len(model.rpn.anchor_generator.sizes)
+        # One size per FPN level — subsample evenly when more sizes than levels.
+        # Multiple sizes per level would change num_anchors_per_location and
+        # break the pretrained RPN head weights.
+        sorted_sizes = sorted(anchor_sizes)
+        if len(sorted_sizes) > n_levels:
+            idxs = [int(round(i * (len(sorted_sizes) - 1) / (n_levels - 1)))
+                    for i in range(n_levels)]
+            sorted_sizes = [sorted_sizes[i] for i in idxs]
+        sizes_per_level = tuple((s,) for s in sorted_sizes)
+        model.rpn.anchor_generator = AnchorGenerator(
+            sizes=sizes_per_level,
+            aspect_ratios=(tuple(aspect_ratios),) * n_levels,
+        )
 
     return model
 
@@ -214,7 +235,21 @@ def parse_args():
                    help="Resume from checkpoint_best.pth in --output-dir")
     p.add_argument("--no-early-stopping", action="store_true",
                    help="Disable early stopping and always train for --epochs epochs")
-    p.add_argument("--num-workers", type=int, default=DEFAULTS["num_workers"])
+    p.add_argument("--num-workers",   type=int,   default=DEFAULTS["num_workers"])
+    p.add_argument("--momentum",      type=float, default=DEFAULTS["momentum"])
+    p.add_argument("--weight-decay",  type=float, default=DEFAULTS["weight_decay"])
+    p.add_argument("--step-size",     type=int,   default=DEFAULTS["step_size"],
+                   help="StepLR: decay LR every N epochs")
+    p.add_argument("--gamma",         type=float, default=DEFAULTS["gamma"],
+                   help="StepLR: multiply LR by this at each step")
+    p.add_argument("--anchor-sizes", type=int, nargs="+",
+                   default=list(DEFAULTS["anchor_sizes"]),
+                   help="RPN anchor sizes in px distributed across FPN levels. "
+                        "Default: LARS-tuned from fasterrcnn_anchor_analysis.ipynb.")
+    p.add_argument("--aspect-ratios", type=float, nargs="+",
+                   default=list(DEFAULTS["aspect_ratios"]),
+                   help="RPN aspect ratios (h/w) shared across all FPN levels. "
+                        "Default: LARS-tuned from fasterrcnn_anchor_analysis.ipynb.")
     return p.parse_args()
 
 
@@ -297,14 +332,17 @@ def main():
     logger.info(f"  batch_size        = {args.batch_size}")
     logger.info(f"  lr                = {args.lr}")
     logger.info(f"  lr_backbone       = {args.lr_backbone}")
-    logger.info(f"  weight_decay      = {DEFAULTS['weight_decay']}")
-    logger.info(f"  step_size / gamma = {DEFAULTS['step_size']} / {DEFAULTS['gamma']}")
+    logger.info(f"  weight_decay      = {args.weight_decay}")
+    logger.info(f"  step_size / gamma = {args.step_size} / {args.gamma}")
+    logger.info(f"  momentum          = {args.momentum}")
     logger.info(f"  early_stopping    = {not args.no_early_stopping}"
                 + (f" (patience={DEFAULTS['early_stopping_patience']})"
                    if not args.no_early_stopping else ""))
 
     # Model
-    model = build_model(args.model, num_classes)
+    model = build_model(args.model, num_classes,
+                        anchor_sizes=args.anchor_sizes,
+                        aspect_ratios=args.aspect_ratios)
     model.to(device)
 
     if args.resume:
@@ -329,11 +367,11 @@ def main():
             {"params": backbone_params, "lr": args.lr_backbone},
             {"params": head_params,     "lr": args.lr},
         ],
-        momentum     = DEFAULTS["momentum"],
-        weight_decay = DEFAULTS["weight_decay"],
+        momentum     = args.momentum,
+        weight_decay = args.weight_decay,
     )
     scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer, step_size=DEFAULTS["step_size"], gamma=DEFAULTS["gamma"]
+        optimizer, step_size=args.step_size, gamma=args.gamma
     )
 
     # Metrics CSV

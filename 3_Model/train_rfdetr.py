@@ -44,7 +44,7 @@ DEFAULTS = dict(
     grad_accum_steps     = 4,       # effective batch = batch_size × grad_accum_steps = 16
     lr                   = 1.21e-4, # trial_004 best HP
     lr_encoder           = 2.81e-5, # trial_004 best HP
-    resolution           = 768,     # trial_004 used 784; large model needs multiple of 32 → 768
+    resolution           = 784,     # base model: multiple of 56 (784=56×14); use multiple of 32 (e.g. 768) for large
     weight_decay         = 1.81e-5, # trial_004 best HP
     grad_clip_max_norm   = 0.083,   # trial_004 best HP
     checkpoint_interval  = 5,
