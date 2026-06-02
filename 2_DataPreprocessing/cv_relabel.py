@@ -579,6 +579,38 @@ def write_relabeled_output(
 
 
 # ===========================================================================
+# Apply cleaned annotations to the active dataset
+# ===========================================================================
+def apply_to_processed(out_root: Path, data_root: Path,
+                       log: logging.Logger) -> None:
+    """
+    Copy {train,valid,test}/_annotations.coco.json from `out_root`
+    (lars_relabeled) into `data_root` (lars_processed), so training scripts
+    pick up the cleaned labels. A .pre-relabel backup is created per split
+    the first time apply runs (never overwritten on subsequent applies).
+    """
+    for split in ("train", "valid", "test"):
+        src = out_root  / split / "_annotations.coco.json"
+        dst = data_root / split / "_annotations.coco.json"
+        backup = dst.with_suffix(dst.suffix + ".pre-relabel")
+
+        if not src.exists():
+            log.warning(f"[apply] {split}: source missing {src}, skipping")
+            continue
+        if not dst.parent.exists():
+            log.warning(f"[apply] {split}: destination dir missing "
+                        f"{dst.parent}, skipping")
+            continue
+
+        if dst.exists() and not backup.exists():
+            shutil.copy2(dst, backup)
+            log.info(f"[apply] {split}: backup → {backup}")
+
+        shutil.copy2(src, dst)
+        log.info(f"[apply] {split}: {src.name} → {dst}")
+
+
+# ===========================================================================
 # Argument parsing
 # ===========================================================================
 def parse_args() -> argparse.Namespace:
@@ -597,6 +629,11 @@ def parse_args() -> argparse.Namespace:
                    help="Directory for fold checkpoints and cache files")
     p.add_argument("--out-root",     default=str(OUT_ROOT),
                    help="Where to write the final relabeled dataset")
+    p.add_argument("--apply",        action="store_true",
+                   help="Copy relabeled JSONs into Data/lars_processed/, making "
+                        "them the active annotations for training. A one-time "
+                        "_annotations.coco.json.pre-relabel backup is created "
+                        "per split if none exists yet.")
     return p.parse_args()
 
 
@@ -752,6 +789,13 @@ def main() -> None:
         out_root       = out_root,
         log            = log,
     )
+
+    # ------------------------------------------------------------------
+    # 5b. Optionally copy into lars_processed/ (active training labels)
+    # ------------------------------------------------------------------
+    if args.apply:
+        log.info("Applying cleaned annotations to lars_processed/ …")
+        apply_to_processed(out_root, DATA_ROOT, log)
 
     # ------------------------------------------------------------------
     # 6. Final summary
