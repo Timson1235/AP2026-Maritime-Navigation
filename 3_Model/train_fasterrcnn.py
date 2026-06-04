@@ -43,22 +43,24 @@ _HERE     = Path(__file__).parent
 DATA_ROOT = _HERE / "../Data/lars_processed"
 
 DEFAULTS = dict(
-    # Defaults mirror the Optuna best trial (frcnn_lars_aug_policy, trial_000,
-    # val/mAP_50_95 = 0.2528).  aug_policy=light_color is not reproduced here
-    # (no augmentation in this script). Anchors are kept as the flat list so
-    # the pretrained RPN head is preserved (the Optuna run used grouped
-    # REC_SIZES and rebuilt the head — a slightly different model).
-    epochs                   = 25,     # was 50; matches Optuna trial budget
-    batch_size               = 8,      # was 4; trial_000 used 8
-    lr                       = 9.06e-3, # was 5e-3
-    lr_backbone              = 1.09e-3, # was 5e-4
-    momentum                 = 0.85,   # was 0.9
-    weight_decay             = 8.82e-4, # was 5e-4
-    step_size                = 20,     # was 15
-    gamma                    = 0.2,    # was 0.1
+    # Defaults mirror the best Optuna trial: fasterrcnn/optuna/trial_002
+    # (val/mAP_50_95 = 0.2604). trial_002 used a heavy multi-knob aug pipeline
+    # (motion blur + brightness/HSV + CLAHE + gamma + downscale + sunflare);
+    # the closest single policy is light_color, so that is the --aug-policy
+    # default — color components match, blur / gamma / downscale / sunflare
+    # are not reproduced. Anchors stay as the flat list (subsampled to one
+    # per FPN level) so the pretrained RPN head is preserved.
+    epochs                   = 25,      # matches Optuna trial budget
+    batch_size               = 16,      # trial_002 used 16
+    lr                       = 2.39e-3, # trial_002 best HP
+    lr_backbone              = 1.42e-4, # trial_002 (= lr * lr_backbone_ratio=0.0595)
+    momentum                 = 0.95,    # trial_002 best HP
+    weight_decay             = 2.07e-5, # trial_002 best HP
+    step_size                = 20,      # trial_002 best HP
+    gamma                    = 0.2,     # trial_002 best HP
     checkpoint_interval      = 5,
-    early_stopping_patience  = 7,      # was 10; matches Optuna noise envelope
-    early_stopping_min_delta = 0.005,  # was 0.001
+    early_stopping_patience  = 7,       # tuned to val-mAP noise envelope
+    early_stopping_min_delta = 0.005,
     num_workers              = 4,
     # Tuned anchors from fasterrcnn_anchor_analysis.ipynb (coverage 66.6% vs 45.6% default)
     anchor_sizes             = (8, 24, 56, 96, 112, 176, 288, 320, 624),
