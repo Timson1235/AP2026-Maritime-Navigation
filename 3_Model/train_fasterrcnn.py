@@ -31,26 +31,34 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import torchvision.transforms.functional as TF
 from PIL import Image
 import supervision as sv
+import albumentations as A
+
+from augmentations import AUG_POLICIES, get_maritime_augmentations
 
 _HERE     = Path(__file__).parent
 DATA_ROOT = _HERE / "../Data/lars_processed"
 
 DEFAULTS = dict(
-    epochs                   = 50,
-    batch_size               = 4,
-    lr                       = 5e-3,   # head / RPN learning rate
-    lr_backbone              = 5e-4,   # backbone (10x lower to preserve features)
-    momentum                 = 0.9,
-    weight_decay             = 5e-4,
-    step_size                = 15,     # StepLR: decay LR every N epochs
-    gamma                    = 0.1,    # StepLR: multiply LR by this
+    # Defaults mirror the Optuna best trial (frcnn_lars_aug_policy, trial_000,
+    # val/mAP_50_95 = 0.2528).  aug_policy=light_color is not reproduced here
+    # (no augmentation in this script). Anchors are kept as the flat list so
+    # the pretrained RPN head is preserved (the Optuna run used grouped
+    # REC_SIZES and rebuilt the head — a slightly different model).
+    epochs                   = 25,     # was 50; matches Optuna trial budget
+    batch_size               = 8,      # was 4; trial_000 used 8
+    lr                       = 9.06e-3, # was 5e-3
+    lr_backbone              = 1.09e-3, # was 5e-4
+    momentum                 = 0.85,   # was 0.9
+    weight_decay             = 8.82e-4, # was 5e-4
+    step_size                = 20,     # was 15
+    gamma                    = 0.2,    # was 0.1
     checkpoint_interval      = 5,
-    early_stopping_patience  = 10,
-    early_stopping_min_delta = 0.001,
+    early_stopping_patience  = 7,      # was 10; matches Optuna noise envelope
+    early_stopping_min_delta = 0.005,  # was 0.001
     num_workers              = 4,
     # Tuned anchors from fasterrcnn_anchor_analysis.ipynb (coverage 66.6% vs 45.6% default)
     anchor_sizes             = (8, 24, 56, 96, 112, 176, 288, 320, 624),
@@ -63,10 +71,16 @@ DEFAULTS = dict(
 # ---------------------------------------------------------------------------
 
 class LARSDetectionDataset(Dataset):
-    """COCO-format detection dataset for LARS."""
+    """COCO-format detection dataset for LARS.
 
-    def __init__(self, root: Path, split: str):
-        self.img_dir = root / split / "images"
+    Optional online augmentation via an albumentations pipeline (xywh boxes).
+    Pass ``pipeline=None`` for validation/test.
+    """
+
+    def __init__(self, root: Path, split: str,
+                 pipeline: A.Compose | None = None):
+        self.img_dir  = root / split / "images"
+        self.pipeline = pipeline
         ann_file = root / split / "_annotations.coco.json"
         with open(ann_file) as f:
             ann = json.load(f)
@@ -86,22 +100,38 @@ class LARSDetectionDataset(Dataset):
 
     def __getitem__(self, idx):
         meta    = self.imgs[idx]
-        img     = Image.open(self.img_dir / meta["file_name"]).convert("RGB")
-        tensor  = TF.to_tensor(img)
+        img_arr = np.array(Image.open(self.img_dir / meta["file_name"]).convert("RGB"))
+        W, H    = meta["width"], meta["height"]
 
-        boxes, labels = [], []
+        # Collect valid GT boxes in COCO xywh format
+        bboxes, cat_ids = [], []
         for a in self.anns_by_img.get(meta["id"], []):
             x, y, w, h = a["bbox"]
-            x2 = x + w;  y2 = y + h
-            x  = max(0.0, x);   y  = max(0.0, y)
-            x2 = min(x2, float(meta["width"]))
-            y2 = min(y2, float(meta["height"]))
+            x = max(0.0, x);  y = max(0.0, y)
+            w = min(w, W - x); h = min(h, H - y)
+            if w > 0 and h > 0:
+                bboxes.append([x, y, w, h])
+                cat_ids.append(self.cat_id_map[a["category_id"]])
+
+        # Apply augmentation if a pipeline is set
+        if self.pipeline is not None and bboxes:
+            result  = self.pipeline(image=img_arr, bboxes=bboxes, category_ids=cat_ids)
+            img_arr = result["image"]
+            bboxes  = list(result["bboxes"])
+            cat_ids = list(result["category_ids"])
+
+        tensor = TF.to_tensor(Image.fromarray(img_arr))
+
+        # Convert xywh -> xyxy
+        boxes_xyxy, labels = [], []
+        for (x, y, w, h), cid in zip(bboxes, cat_ids):
+            x2, y2 = x + w, y + h
             if x2 > x and y2 > y:
-                boxes.append([x, y, x2, y2])
-                labels.append(self.cat_id_map[a["category_id"]])
+                boxes_xyxy.append([x, y, x2, y2])
+                labels.append(cid)
 
         target = {
-            "boxes":    (torch.as_tensor(boxes,  dtype=torch.float32) if boxes
+            "boxes":    (torch.as_tensor(boxes_xyxy, dtype=torch.float32) if boxes_xyxy
                          else torch.zeros((0, 4), dtype=torch.float32)),
             "labels":   (torch.as_tensor(labels, dtype=torch.int64) if labels
                          else torch.zeros(0, dtype=torch.int64)),
@@ -202,6 +232,52 @@ def build_model(model_name: str, num_classes: int,
 
 
 # ---------------------------------------------------------------------------
+# Repeat Factor Sampling  (LVIS-style class-balanced oversampling)
+# ---------------------------------------------------------------------------
+
+def compute_repeat_factors(ds: Dataset,
+                           t: float    = 0.1,
+                           max_r: float = 10.0) -> list[float]:
+    """
+    Per-image repeat factor for class-balanced sampling
+    (LVIS Repeat Factor Sampling, adapted to LARS frequencies).
+
+      f_c = (# train images containing category c) / N
+      r_c = max(1, sqrt(t / f_c))            (capped at max_r)
+      r_i = max over c in image i of r_c
+
+    LVIS uses t=1e-3 because their tail goes <0.01%. LARS's rarest
+    class (Float) is at 0.9%, so t=0.1 is calibrated to give it a
+    meaningful boost while leaving the majority classes untouched:
+      Float        (0.9%)  -> 3.3x
+      Animal       (3.2%)  -> 1.8x
+      Paddle board (4.0%)  -> 1.6x
+      Swimmer      (4.8%)  -> 1.4x
+      Row boats    (9.1%)  -> 1.0x (just below)
+      Buoy / Other / Boat  -> 1.0x (above t)
+    Mean repeat factor ~= 1.09 -> effective epoch size grows ~9%.
+
+    Expects ``ds`` to expose ``imgs`` (list of COCO image dicts) and
+    ``anns_by_img`` (dict image_id -> list of annotation dicts).
+    """
+    from collections import defaultdict
+    N = len(ds.imgs)
+    cat_img_count: dict[int, int] = defaultdict(int)
+    per_img_cats:  list[set[int]] = []
+
+    for img in ds.imgs:
+        cats = {a["category_id"] for a in ds.anns_by_img.get(img["id"], [])}
+        per_img_cats.append(cats)
+        for c in cats:
+            cat_img_count[c] += 1
+
+    r_c = {c: min(max_r, max(1.0, (t / (n / N)) ** 0.5))
+           for c, n in cat_img_count.items()}
+
+    return [max((r_c[c] for c in cats), default=1.0) for cats in per_img_cats]
+
+
+# ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
 
@@ -288,6 +364,11 @@ def parse_args():
                    default=list(DEFAULTS["aspect_ratios"]),
                    help="RPN aspect ratios (h/w) shared across all FPN levels. "
                         "Default: LARS-tuned from fasterrcnn_anchor_analysis.ipynb.")
+    p.add_argument("--oversample", choices=["off", "rfs"], default="off",
+                   help="Class-balanced oversampling. rfs = LVIS Repeat Factor "
+                        "Sampling with t=0.1 (Float ~3.3x, common classes 1x).")
+    p.add_argument("--aug-policy", choices=list(AUG_POLICIES), default="light_color",
+                   help="Online augmentation policy (default matches Optuna trial_000).")
     return p.parse_args()
 
 
@@ -349,13 +430,29 @@ def main():
         logger.error(f"Dataset not found at {DATA_ROOT.resolve()}")
         sys.exit(1)
 
-    train_ds = LARSDetectionDataset(DATA_ROOT, "train")
-    val_ds   = LARSDetectionDataset(DATA_ROOT, "valid")
+    aug_pipeline = (get_maritime_augmentations(args.aug_policy)
+                    if args.aug_policy != "none" else None)
+    train_ds = LARSDetectionDataset(DATA_ROOT, "train", pipeline=aug_pipeline)
+    val_ds   = LARSDetectionDataset(DATA_ROOT, "valid", pipeline=None)
     num_classes = train_ds.num_classes
+    logger.info(f"Aug policy    : {args.aug_policy}")
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, collate_fn=collate_fn,
-                              pin_memory=device.type == "cuda")
+    if args.oversample == "rfs":
+        weights = compute_repeat_factors(train_ds, t=0.1)
+        sampler = WeightedRandomSampler(
+            weights, num_samples=len(train_ds), replacement=True,
+        )
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                                  sampler=sampler,
+                                  num_workers=args.num_workers, collate_fn=collate_fn,
+                                  pin_memory=device.type == "cuda")
+        logger.info(f"Oversample    : rfs  (t=0.1, max_r={max(weights):.2f}, "
+                    f"effective_size={sum(weights)/len(weights):.2f}x)")
+    else:
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                                  num_workers=args.num_workers, collate_fn=collate_fn,
+                                  pin_memory=device.type == "cuda")
+        logger.info("Oversample    : off")
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False,
                               num_workers=args.num_workers, collate_fn=collate_fn,
                               pin_memory=device.type == "cuda")

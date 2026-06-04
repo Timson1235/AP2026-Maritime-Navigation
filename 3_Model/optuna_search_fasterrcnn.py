@@ -53,7 +53,9 @@ import albumentations as A
 import optuna
 from optuna.samplers import TPESampler, RandomSampler
 
-from train_fasterrcnn import build_model, evaluate, collate_fn
+from train_fasterrcnn import (
+    build_model, evaluate, collate_fn, compute_repeat_factors,
+)
 from augmentations import AUG_POLICIES, get_maritime_augmentations
 
 # ---------------------------------------------------------------------------
@@ -159,49 +161,6 @@ class AugLARSDataset(Dataset):
             "image_id": torch.tensor([meta["id"]]),
         }
         return tensor, target
-
-
-# ---------------------------------------------------------------------------
-# Repeat Factor Sampling  (LVIS-style class-balanced oversampling)
-# ---------------------------------------------------------------------------
-
-def compute_repeat_factors(ds: "AugLARSDataset",
-                           t: float    = 0.1,
-                           max_r: float = 10.0) -> list[float]:
-    """
-    Per-image repeat factor for class-balanced sampling
-    (LVIS Repeat Factor Sampling, adapted to LARS frequencies).
-
-      f_c = (# train images containing category c) / N
-      r_c = max(1, sqrt(t / f_c))            (capped at max_r)
-      r_i = max over c in image i of r_c
-
-    LVIS uses t=1e-3 because their tail goes <0.01%. LARS's rarest
-    class (Float) is at 0.9%, so t=0.1 is calibrated to give it a
-    meaningful boost while leaving the majority classes untouched:
-      Float        (0.9%)  → 3.3×
-      Animal       (3.2%)  → 1.8×
-      Paddle board (4.0%)  → 1.6×
-      Swimmer      (4.8%)  → 1.4×
-      Row boats    (9.1%)  → 1.0× (just below)
-      Buoy / Other / Boat  → 1.0×  (above t)
-    Mean repeat factor ≈ 1.09 → effective epoch size grows ~9%.
-    """
-    from collections import defaultdict
-    N = len(ds.imgs)
-    cat_img_count: dict[int, int] = defaultdict(int)
-    per_img_cats:  list[set[int]] = []
-
-    for img in ds.imgs:
-        cats = {a["category_id"] for a in ds.anns_by_img.get(img["id"], [])}
-        per_img_cats.append(cats)
-        for c in cats:
-            cat_img_count[c] += 1
-
-    r_c = {c: min(max_r, max(1.0, (t / (n / N)) ** 0.5))
-           for c, n in cat_img_count.items()}
-
-    return [max((r_c[c] for c in cats), default=1.0) for cats in per_img_cats]
 
 
 # ---------------------------------------------------------------------------

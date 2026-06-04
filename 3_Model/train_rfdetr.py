@@ -20,14 +20,22 @@ Checkpoints and metrics.csv are saved to <output-dir>.
 """
 
 import argparse
+import json
 import logging
 import random
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 import torch
+
+from augmentations import AUG_POLICIES, get_maritime_augmentations
+from optuna_search_rfdetr import (
+    ANN_FILE, ANN_BACKUP, AUG_SUFFIX,
+    apply_augmentation, safe_undo,
+)
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -39,18 +47,98 @@ DATA_ROOT = _HERE / "../Data/lars_processed"
 # Default hyperparameters
 # ---------------------------------------------------------------------------
 DEFAULTS = dict(
+    # Mirror the Optuna best trial: rfdetr_relabeled_lb / trial_004
+    # (val/mAP_50_95 = 0.379). trial_004 used aug_copies=2 with a heavy
+    # multi-knob aug pipeline; closest single policy is
+    # sensor_noise_and_occlusion, so that is the --aug-policy default.
     epochs               = 100,
     batch_size           = 4,
-    grad_accum_steps     = 4,       # effective batch = batch_size × grad_accum_steps = 16
+    grad_accum_steps     = 4,       # effective batch = 4 x 4 = 16 (trial_004)
     lr                   = 1.21e-4, # trial_004 best HP
     lr_encoder           = 2.81e-5, # trial_004 best HP
-    resolution           = 784,     # base model: multiple of 56 (784=56×14); use multiple of 32 (e.g. 768) for large
+    resolution           = 784,     # base: multiple of 56 (784=56x14); large: multiple of 32 (e.g. 768)
     weight_decay         = 1.81e-5, # trial_004 best HP
     grad_clip_max_norm   = 0.083,   # trial_004 best HP
+    aug_copies           = 2,       # trial_004 best HP (used when --aug-policy != none)
     checkpoint_interval  = 5,
     early_stopping_patience  = 10,
     early_stopping_min_delta = 0.001,
 )
+
+
+# ---------------------------------------------------------------------------
+# Offline class-balanced oversampling  (LVIS-style Repeat Factor Sampling)
+# ---------------------------------------------------------------------------
+def apply_oversampling(t: float = 0.1, max_r: float = 10.0,
+                       seed: int = 4) -> tuple[int, int]:
+    """
+    Mutate ``ANN_FILE`` in-place to duplicate image entries for rare-class
+    images, COCO-side only — no disk image copies (each duplicate is a new
+    images[] entry pointing at the same on-disk file_name).
+
+      f_c = (# train images containing category c) / N
+      r_c = max(1, sqrt(t / f_c))     (capped at max_r)
+      r_i = max over c in image i of r_c
+      extras = floor(r_i) - 1 + Bernoulli(r_i - floor(r_i))
+
+    Stochastic rounding ensures Animal/Paddle/Swimmer (r_c ~ 1.4–1.8) also
+    get a fractional boost rather than being silently floored to 0.
+
+    Backs the original up to ``ANN_BACKUP`` if no backup exists yet.
+    safe_undo() restores from that backup.
+
+    Returns (n_added_images, n_added_annotations).
+    """
+    # Always read the current (possibly already-augmented) JSON.
+    with open(ANN_FILE) as f:
+        ann = json.load(f)
+    # Preserve a backup of the *true* original — only write it once.
+    if not ANN_BACKUP.exists():
+        ANN_BACKUP.write_text(json.dumps(ann))
+
+    imgs        = ann["images"]
+    anns_by_img: dict[int, list] = defaultdict(list)
+    for a in ann["annotations"]:
+        anns_by_img[a["image_id"]].append(a)
+
+    N = len(imgs)
+    cat_img_count: dict[int, int] = defaultdict(int)
+    per_img_cats:  list[set[int]] = []
+    for img in imgs:
+        cats = {a["category_id"] for a in anns_by_img.get(img["id"], [])}
+        per_img_cats.append(cats)
+        for c in cats:
+            cat_img_count[c] += 1
+
+    r_c = {c: min(max_r, max(1.0, (t / (n / N)) ** 0.5))
+           for c, n in cat_img_count.items()}
+
+    next_img_id = max(img["id"] for img in imgs) + 1
+    next_ann_id = max((a["id"] for a in ann["annotations"]), default=0) + 1
+
+    rng = random.Random(seed)
+    new_images: list[dict] = []
+    new_anns:   list[dict] = []
+    for img, cats in zip(imgs, per_img_cats):
+        r_i   = max((r_c[c] for c in cats), default=1.0)
+        floor = int(r_i)
+        extra = floor - 1 + (1 if rng.random() < (r_i - floor) else 0)
+        if extra <= 0:
+            continue
+        for _ in range(extra):
+            new_img = {**img, "id": next_img_id}
+            new_images.append(new_img)
+            for a in anns_by_img.get(img["id"], []):
+                new_anns.append({**a, "id": next_ann_id, "image_id": next_img_id})
+                next_ann_id += 1
+            next_img_id += 1
+
+    ann["images"].extend(new_images)
+    ann["annotations"].extend(new_anns)
+    with open(ANN_FILE, "w") as f:
+        json.dump(ann, f)
+
+    return len(new_images), len(new_anns)
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +175,15 @@ def parse_args():
     p.add_argument("--data-root", default=None,
                    help="Override dataset root (default: Data/lars_processed). "
                         "Pass e.g. ../Data/lars_processed to use a different split.")
+    p.add_argument("--aug-policy", choices=list(AUG_POLICIES),
+                   default="sensor_noise_and_occlusion",
+                   help="Offline augmentation policy applied via aug_copies "
+                        "image duplicates (default mirrors trial_004's heavy mix).")
+    p.add_argument("--aug-copies", type=int, default=DEFAULTS["aug_copies"],
+                   help="Augmented copies per training image (0 disables augmentation).")
+    p.add_argument("--oversample", choices=["off", "rfs"], default="off",
+                   help="Class-balanced oversampling via JSON duplicate entries. "
+                        "rfs = LVIS Repeat Factor Sampling (t=0.1; Float ~3.3x, common 1x).")
     return p.parse_args()
 
 
@@ -210,32 +307,64 @@ def main():
         from rfdetr import RFDETRBase
         model = RFDETRBase(resolution=args.resolution)
 
-    logger.info("Starting training …")
-    t_train_start = time.time()
-    train_kwargs = dict(
-        dataset_dir              = str(DATA_ROOT),
-        epochs                   = args.epochs,
-        batch_size               = args.batch_size,
-        grad_accum_steps         = DEFAULTS["grad_accum_steps"],
-        lr                       = args.lr,
-        lr_encoder               = args.lr_encoder,
-        resolution               = args.resolution,
-        weight_decay             = DEFAULTS["weight_decay"],
-        grad_clip_max_norm       = DEFAULTS["grad_clip_max_norm"],
-        checkpoint_interval      = DEFAULTS["checkpoint_interval"],
-        output_dir               = str(output_dir),
-        resume                   = str(resume_ckpt) if resume_ckpt else None,
-        early_stopping           = not args.no_early_stopping,
-        early_stopping_patience  = DEFAULTS["early_stopping_patience"],
-        early_stopping_min_delta = DEFAULTS["early_stopping_min_delta"],
-        early_stopping_use_ema   = False,
-        num_workers              = args.num_workers,
-    )
-    if args.device:
-        train_kwargs["device"] = args.device
+    # ── Offline dataset ops: oversample + augmentation (mutate JSON) ─────────
+    # RFDETR's trainer owns the DataLoader internally — no place to inject a
+    # WeightedRandomSampler — so both ops happen by editing _annotations.coco.json
+    # before training and restoring afterwards via safe_undo.
+    if ANN_BACKUP.exists():
+        logger.info("Found stale augmented JSON — undoing first …")
+        safe_undo()
 
-    model.train(**train_kwargs)
-    t_train_elapsed = time.time() - t_train_start
+    try:
+        # Augmentation must run before oversampling — otherwise duplicate JSON
+        # entries (from oversampling) would race for the same aug filename and
+        # overwrite each other.
+        if args.aug_policy != "none" and args.aug_copies > 0:
+            pipeline = get_maritime_augmentations(args.aug_policy)
+            t_aug = time.time()
+            logger.info(f"Augmentation    : policy={args.aug_policy}  copies={args.aug_copies} (offline) …")
+            n_img, n_ann = apply_augmentation(pipeline, copies=args.aug_copies, seed=4)
+            logger.info(f"  +{n_img:,} images  +{n_ann:,} annotations  ({time.time()-t_aug:.0f}s)")
+        else:
+            logger.info(f"Augmentation    : off  (aug_policy={args.aug_policy}, aug_copies={args.aug_copies})")
+
+        if args.oversample == "rfs":
+            n_img, n_ann = apply_oversampling(t=0.1)
+            logger.info(f"Oversample (rfs): +{n_img} JSON entries, +{n_ann} annotations")
+        else:
+            logger.info("Oversample      : off")
+
+        logger.info("Starting training …")
+        t_train_start = time.time()
+        train_kwargs = dict(
+            dataset_dir              = str(DATA_ROOT),
+            epochs                   = args.epochs,
+            batch_size               = args.batch_size,
+            grad_accum_steps         = DEFAULTS["grad_accum_steps"],
+            lr                       = args.lr,
+            lr_encoder               = args.lr_encoder,
+            resolution               = args.resolution,
+            weight_decay             = DEFAULTS["weight_decay"],
+            grad_clip_max_norm       = DEFAULTS["grad_clip_max_norm"],
+            checkpoint_interval      = DEFAULTS["checkpoint_interval"],
+            output_dir               = str(output_dir),
+            resume                   = str(resume_ckpt) if resume_ckpt else None,
+            early_stopping           = not args.no_early_stopping,
+            early_stopping_patience  = DEFAULTS["early_stopping_patience"],
+            early_stopping_min_delta = DEFAULTS["early_stopping_min_delta"],
+            early_stopping_use_ema   = False,
+            num_workers              = args.num_workers,
+        )
+        if args.device:
+            train_kwargs["device"] = args.device
+
+        model.train(**train_kwargs)
+        t_train_elapsed = time.time() - t_train_start
+    finally:
+        # Always restore the original JSON + delete augmented files, even on failure.
+        if ANN_BACKUP.exists():
+            logger.info("Restoring original annotations …")
+            safe_undo()
 
     # ── Post-training summary ──────────────────────────────────────────────
     h, rem = divmod(int(t_train_elapsed), 3600)
