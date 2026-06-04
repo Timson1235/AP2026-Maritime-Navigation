@@ -120,6 +120,20 @@ def collate_fn(batch):
 
 def build_model(model_name: str, num_classes: int,
                 anchor_sizes=None, aspect_ratios=None) -> torch.nn.Module:
+    """
+    `anchor_sizes` accepts two formats:
+
+      - **Flat**  — e.g. ``(8, 24, 56, 96, 112, 176, 288, 320, 624)``.
+        Sizes are subsampled to one-per-FPN-level. Keeps the pretrained RPN
+        head weights (``num_anchors_per_location`` stays at the default 3).
+
+      - **Grouped** (one tuple per FPN level) — e.g.
+        ``((8, 24), (56, 96), (112, 176), (288, 320), (512, 624))``.
+        Used as-is. Short groups are right-padded with their last size so
+        ``num_anchors_per_location`` is consistent across levels (required
+        by torchvision's RPN). If the resulting count differs from the
+        pretrained default (3), the RPN head is rebuilt from scratch.
+    """
     from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 
     if model_name == "large":
@@ -144,21 +158,45 @@ def build_model(model_name: str, num_classes: int,
         model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
 
     if anchor_sizes is not None and aspect_ratios is not None:
-        from torchvision.models.detection.rpn import AnchorGenerator
-        n_levels = len(model.rpn.anchor_generator.sizes)
-        # One size per FPN level — subsample evenly when more sizes than levels.
-        # Multiple sizes per level would change num_anchors_per_location and
-        # break the pretrained RPN head weights.
-        sorted_sizes = sorted(anchor_sizes)
-        if len(sorted_sizes) > n_levels:
-            idxs = [int(round(i * (len(sorted_sizes) - 1) / (n_levels - 1)))
-                    for i in range(n_levels)]
-            sorted_sizes = [sorted_sizes[i] for i in idxs]
-        sizes_per_level = tuple((s,) for s in sorted_sizes)
+        from torchvision.models.detection.rpn import AnchorGenerator, RPNHead
+        n_levels       = len(model.rpn.anchor_generator.sizes)
+        ratios_tuple   = tuple(aspect_ratios)
+        default_n_apl  = model.rpn.anchor_generator.num_anchors_per_location()[0]
+
+        is_grouped = (len(anchor_sizes) > 0
+                      and hasattr(anchor_sizes[0], "__iter__"))
+
+        if is_grouped:
+            if len(anchor_sizes) != n_levels:
+                raise ValueError(
+                    f"Grouped anchor_sizes has {len(anchor_sizes)} levels, "
+                    f"but FPN has {n_levels}."
+                )
+            groups = [tuple(g) for g in anchor_sizes]
+            max_sizes_per_level = max(len(g) for g in groups)
+            sizes_per_level = tuple(
+                g + (g[-1],) * (max_sizes_per_level - len(g)) for g in groups
+            )
+        else:
+            # Flat list — subsample evenly to one-per-level.
+            sorted_sizes = sorted(anchor_sizes)
+            if len(sorted_sizes) > n_levels:
+                idxs = [int(round(i * (len(sorted_sizes) - 1) / (n_levels - 1)))
+                        for i in range(n_levels)]
+                sorted_sizes = [sorted_sizes[i] for i in idxs]
+            sizes_per_level = tuple((s,) for s in sorted_sizes)
+
         model.rpn.anchor_generator = AnchorGenerator(
             sizes=sizes_per_level,
-            aspect_ratios=(tuple(aspect_ratios),) * n_levels,
+            aspect_ratios=(ratios_tuple,) * n_levels,
         )
+
+        # Rebuild RPN head if anchors/location no longer match the pretrained
+        # head's output width (otherwise the head produces too few/many channels).
+        new_n_apl = len(sizes_per_level[0]) * len(ratios_tuple)
+        if new_n_apl != default_n_apl:
+            in_channels = model.backbone.out_channels
+            model.rpn.head = RPNHead(in_channels, new_n_apl, conv_depth=2)
 
     return model
 

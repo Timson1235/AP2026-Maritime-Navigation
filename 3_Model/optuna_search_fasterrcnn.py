@@ -54,6 +54,7 @@ import optuna
 from optuna.samplers import TPESampler, RandomSampler
 
 from train_fasterrcnn import build_model, evaluate, collate_fn
+from augmentations import AUG_POLICIES, get_maritime_augmentations
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -61,9 +62,31 @@ from train_fasterrcnn import build_model, evaluate, collate_fn
 _HERE     = Path(__file__).parent
 DATA_ROOT = (_HERE / "../Data/lars_processed").resolve()
 
-EARLY_STOPPING_PATIENCE  = 5
-EARLY_STOPPING_MIN_DELTA = 0.001
+EARLY_STOPPING_PATIENCE  = 7      # bumped from 5; val mAP noise envelope ~±0.015
+EARLY_STOPPING_MIN_DELTA = 0.005  # bumped from 0.001; below this is noise
 NUM_WORKERS              = 4
+
+# ---------------------------------------------------------------------------
+# Hardcoded anchor geometry  (from fasterrcnn_anchor_analysis.ipynb)
+# ---------------------------------------------------------------------------
+# K-means on training-set GT box sizes (with IoU distance) → 9 cluster sizes
+# distributed across the 5 FPN levels P2–P6. Tailored to LARS maritime objects
+# (distant small craft up through close-up large vessels). Optuna leaves these
+# fixed and only searches LR / weight decay / augmentation.
+#
+# torchvision's RPN requires the same num_anchors_per_location at every level,
+# so we keep two sizes per level (the analysis suggested only one for P6 —
+# we add 512 alongside 624 so all levels have 2×3 = 6 anchors/location).
+# This changes num_anchors_per_location from the pretrained default 3 to 6,
+# which triggers an RPN head rebuild in build_model().
+REC_SIZES = (
+    (8,   24),    # P2: small distant objects
+    (56,  96),    # P3
+    (112, 176),   # P4
+    (288, 320),   # P5
+    (512, 624),   # P6: large close-up ships (padded from analysis (624,))
+)
+REC_RATIOS = (0.5, 0.75, 1.25)
 
 
 # ---------------------------------------------------------------------------
@@ -139,122 +162,6 @@ class AugLARSDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
-# Augmentation pipeline
-# ---------------------------------------------------------------------------
-
-def build_aug_pipeline(trial: optuna.Trial) -> A.Compose:
-    """
-    Sample an albumentations pipeline from Optuna trial suggestions.
-    Mirrors the maritime augmentation groups used for RF-DETR.
-    """
-    transforms: list = []
-
-    # ── 1. Geometric ─────────────────────────────────────────────────────────
-    flip_p = trial.suggest_float("aug_flip_p", 0.3, 0.7)
-    transforms.append(A.HorizontalFlip(p=flip_p))
-
-    if trial.suggest_categorical("aug_use_perspective", [True, False]):
-        persp_scale = trial.suggest_float("aug_perspective_scale", 0.02, 0.08)
-        transforms.append(A.Perspective(scale=(0.01, persp_scale), keep_size=True, p=0.35))
-
-    # ── 2. Colour ────────────────────────────────────────────────────────────
-    brightness_limit = trial.suggest_float("aug_brightness_limit", 0.10, 0.45)
-    contrast_limit   = trial.suggest_float("aug_contrast_limit",   0.10, 0.45)
-    brightness_p     = trial.suggest_float("aug_brightness_p",     0.40, 0.90)
-    transforms.append(A.RandomBrightnessContrast(
-        brightness_limit=brightness_limit,
-        contrast_limit=contrast_limit,
-        p=brightness_p,
-    ))
-
-    hsv_hue = trial.suggest_int  ("aug_hsv_hue_limit", 2,  20)
-    hsv_sat = trial.suggest_int  ("aug_hsv_sat_limit", 20, 70)
-    hsv_val = trial.suggest_int  ("aug_hsv_val_limit", 15, 50)
-    hsv_p   = trial.suggest_float("aug_hsv_p",         0.30, 0.85)
-    transforms.append(A.HueSaturationValue(
-        hue_shift_limit=hsv_hue,
-        sat_shift_limit=hsv_sat,
-        val_shift_limit=hsv_val,
-        p=hsv_p,
-    ))
-
-    if trial.suggest_categorical("aug_use_gamma", [True, False]):
-        gamma_p = trial.suggest_float("aug_gamma_p", 0.20, 0.60)
-        transforms.append(A.RandomGamma(gamma_limit=(70, 130), p=gamma_p))
-
-    # ── 3. Contrast tools ────────────────────────────────────────────────────
-    clahe_p = trial.suggest_float("aug_clahe_p", 0.0, 0.55)
-    if clahe_p > 0:
-        transforms.append(A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=clahe_p))
-
-    if trial.suggest_categorical("aug_use_equalize", [True, False]):
-        transforms.append(A.Equalize(p=0.25))
-
-    if trial.suggest_categorical("aug_use_sharpen", [True, False]):
-        transforms.append(A.Sharpen(alpha=(0.1, 0.4), lightness=(0.8, 1.2), p=0.30))
-
-    if trial.suggest_categorical("aug_use_downscale", [True, False]):
-        transforms.append(A.Downscale(scale_range=(0.6, 0.9), p=0.20))
-
-    # ── 4. Blur / noise ──────────────────────────────────────────────────────
-    blur_type = trial.suggest_categorical("aug_blur_type", ["none", "gaussian", "motion"])
-    if blur_type != "none":
-        blur_p = trial.suggest_float("aug_blur_p", 0.10, 0.55)
-        if blur_type == "motion":
-            transforms.append(A.MotionBlur(blur_limit=(3, 11), p=blur_p))
-        else:
-            transforms.append(A.GaussianBlur(blur_limit=(3, 7), p=blur_p))
-
-    if trial.suggest_categorical("aug_use_iso_noise", [True, False]):
-        transforms.append(A.ISONoise(
-            color_shift=(0.01, 0.05), intensity=(0.10, 0.40), p=0.30
-        ))
-
-    if trial.suggest_categorical("aug_use_compression", [True, False]):
-        transforms.append(A.ImageCompression(quality_range=(50, 90), p=0.25))
-
-    # ── 5. Maritime weather ──────────────────────────────────────────────────
-    if trial.suggest_categorical("aug_use_shadow", [True, False]):
-        transforms.append(A.RandomShadow(p=0.35))
-
-    if trial.suggest_categorical("aug_use_fog", [True, False]):
-        fog_coef = trial.suggest_float("aug_fog_coef_max", 0.10, 0.35)
-        transforms.append(A.RandomFog(fog_coef_range=(0.05, fog_coef), p=0.30))
-
-    if trial.suggest_categorical("aug_use_rain", [True, False]):
-        transforms.append(A.RandomRain(
-            slant_range=(-10, 10), drop_length=8, drop_width=1,
-            brightness_coefficient=0.9, p=0.25,
-        ))
-
-    if trial.suggest_categorical("aug_use_sunflare", [True, False]):
-        transforms.append(A.RandomSunFlare(
-            flare_roi=(0.0, 0.0, 1.0, 0.5), src_radius=100, p=0.20,
-        ))
-
-    # ── 6. Occlusion ─────────────────────────────────────────────────────────
-    if trial.suggest_categorical("aug_use_dropout", [True, False]):
-        n_holes = trial.suggest_int("aug_dropout_holes", 1, 10)
-        transforms.append(A.CoarseDropout(
-            num_holes_range=(1, n_holes),
-            hole_height_range=(16, 48),
-            hole_width_range=(16, 48),
-            fill=0,
-            p=0.30,
-        ))
-
-    return A.Compose(
-        transforms,
-        bbox_params=A.BboxParams(
-            format="coco",
-            label_fields=["category_ids"],
-            min_area=50.0,
-            min_visibility=0.1,
-        ),
-    )
-
-
-# ---------------------------------------------------------------------------
 # Metrics helper
 # ---------------------------------------------------------------------------
 
@@ -304,14 +211,15 @@ def objective(
     gamma         = trial.suggest_categorical("gamma",     [0.05, 0.1, 0.2])
 
     # ── Sample augmentation ───────────────────────────────────────────────────
-    aug_enabled = False if args.smoke else trial.suggest_categorical("aug_enabled", [True, False])
+    aug_policy = ("none" if args.smoke
+                  else trial.suggest_categorical("aug_policy", list(AUG_POLICIES)))
 
     logger.info("")
     logger.info("=" * 64)
     logger.info(f"Trial {trial.number:3d}  →  {trial_dir.name}")
     logger.info(f"  lr={lr:.2e}  lr_backbone={lr_backbone:.2e}  wd={weight_decay:.2e}")
     logger.info(f"  momentum={momentum}  batch={batch_size}  model=base")
-    logger.info(f"  step_size={step_size}  gamma={gamma}  aug={aug_enabled}")
+    logger.info(f"  step_size={step_size}  gamma={gamma}  aug_policy={aug_policy}")
     logger.info("=" * 64)
 
     t_trial_start = time.time()
@@ -322,7 +230,7 @@ def objective(
         return _r.uniform(0.1, 0.5)
 
     # ── Build augmentation pipeline ───────────────────────────────────────────
-    aug_pipeline = build_aug_pipeline(trial) if aug_enabled else None
+    aug_pipeline = get_maritime_augmentations(aug_policy) if aug_policy != "none" else None
 
     # ── Device ───────────────────────────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -344,7 +252,14 @@ def objective(
     )
 
     # ── Model ────────────────────────────────────────────────────────────────
-    model = build_model(model_variant, train_ds.num_classes)
+    # Anchors are hardcoded from the maritime-aware anchor analysis (see
+    # REC_SIZES / REC_RATIOS at module top). Optuna does not search them.
+    model = build_model(
+        model_variant,
+        train_ds.num_classes,
+        anchor_sizes  = REC_SIZES,
+        aspect_ratios = REC_RATIOS,
+    )
     model.to(device)
 
     # ── Optimizer ────────────────────────────────────────────────────────────

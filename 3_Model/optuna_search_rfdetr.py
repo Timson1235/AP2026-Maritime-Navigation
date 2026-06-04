@@ -53,6 +53,8 @@ import albumentations as A
 from PIL import Image
 from tqdm import tqdm
 
+from augmentations import AUG_POLICIES, get_maritime_augmentations
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -68,155 +70,6 @@ AUG_SUFFIX = "_aug"   # must match rfdetr_preprocessing.py
 # ---------------------------------------------------------------------------
 # Augmentation helpers
 # ---------------------------------------------------------------------------
-
-def build_aug_pipeline(trial: optuna.Trial) -> A.Compose:
-    """
-    Build an albumentations Compose pipeline from Optuna trial suggestions.
-
-    Context: 2,102 training images, 7,761 annotations with heavy class imbalance
-    (boats: 4,957 | buoys: 1,274 | floats: 19 | paddle boards: 124).
-    Heavy augmentation is warranted to prevent overfitting on the small dataset
-    and to improve coverage of rare classes and challenging conditions.
-
-    Transforms are organised into five groups:
-      1. Geometric        — always applied, tunable probability
-      2. Colour           — always applied, tunable intensity
-      3. Contrast tools   — optional (CLAHE, gamma, sharpening, equalise)
-      4. Blur / noise     — optional (gaussian, motion blur, ISO noise, compression)
-      5. Maritime weather — optional (shadow, fog, rain, sun flare)
-      6. Occlusion        — optional (coarse dropout for spray / partial cover)
-    """
-    transforms: list = []
-
-    # ── 1. Geometric ─────────────────────────────────────────────────────────
-    flip_p = trial.suggest_float("aug_flip_p", 0.3, 0.7)
-    transforms.append(A.HorizontalFlip(p=flip_p))
-
-    # Subtle perspective shift — simulates camera pitch/roll on a moving vessel
-    if trial.suggest_categorical("aug_use_perspective", [True, False]):
-        persp_scale = trial.suggest_float("aug_perspective_scale", 0.02, 0.08)
-        transforms.append(A.Perspective(scale=(0.01, persp_scale), keep_size=True, p=0.35))
-
-    # ── 2. Colour ────────────────────────────────────────────────────────────
-    brightness_limit = trial.suggest_float("aug_brightness_limit", 0.10, 0.45)
-    contrast_limit   = trial.suggest_float("aug_contrast_limit",   0.10, 0.45)
-    brightness_p     = trial.suggest_float("aug_brightness_p",     0.40, 0.90)
-    transforms.append(A.RandomBrightnessContrast(
-        brightness_limit=brightness_limit,
-        contrast_limit=contrast_limit,
-        p=brightness_p,
-    ))
-
-    hsv_hue = trial.suggest_int  ("aug_hsv_hue_limit", 2,  20)
-    hsv_sat = trial.suggest_int  ("aug_hsv_sat_limit", 20, 70)
-    hsv_val = trial.suggest_int  ("aug_hsv_val_limit", 15, 50)
-    hsv_p   = trial.suggest_float("aug_hsv_p",         0.30, 0.85)
-    transforms.append(A.HueSaturationValue(
-        hue_shift_limit=hsv_hue,
-        sat_shift_limit=hsv_sat,
-        val_shift_limit=hsv_val,
-        p=hsv_p,
-    ))
-
-    # Gamma — simulates exposure variation (overcast dawn vs bright noon)
-    if trial.suggest_categorical("aug_use_gamma", [True, False]):
-        gamma_p = trial.suggest_float("aug_gamma_p", 0.20, 0.60)
-        transforms.append(A.RandomGamma(gamma_limit=(70, 130), p=gamma_p))
-
-    # ── 3. Contrast tools ────────────────────────────────────────────────────
-
-    # CLAHE — local contrast enhancement, combats glare and reflections on water
-    clahe_p = trial.suggest_float("aug_clahe_p", 0.0, 0.55)
-    if clahe_p > 0:
-        transforms.append(A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=clahe_p))
-
-    # Histogram equalisation — alternative global contrast boost
-    if trial.suggest_categorical("aug_use_equalize", [True, False]):
-        transforms.append(A.Equalize(p=0.25))
-
-    # Sharpening — counter soft focus / spray haze
-    if trial.suggest_categorical("aug_use_sharpen", [True, False]):
-        transforms.append(A.Sharpen(alpha=(0.1, 0.4), lightness=(0.8, 1.2), p=0.30))
-
-    # Downscale + upsample — simulates lower-resolution sensor or distant targets
-    if trial.suggest_categorical("aug_use_downscale", [True, False]):
-        transforms.append(A.Downscale(scale_range=(0.6, 0.9), p=0.20))
-
-    # ── 4. Blur / noise ──────────────────────────────────────────────────────
-
-    # Blur type — sea haze, spray, camera motion from vessel movement
-    blur_type = trial.suggest_categorical("aug_blur_type", ["none", "gaussian", "motion"])
-    if blur_type != "none":
-        blur_p = trial.suggest_float("aug_blur_p", 0.10, 0.55)
-        if blur_type == "motion":
-            transforms.append(A.MotionBlur(blur_limit=(3, 11), p=blur_p))
-        else:
-            transforms.append(A.GaussianBlur(blur_limit=(3, 7), p=blur_p))
-
-    # ISO / sensor noise — low-light, high-ISO night operations
-    if trial.suggest_categorical("aug_use_iso_noise", [True, False]):
-        transforms.append(A.ISONoise(
-            color_shift=(0.01, 0.05),
-            intensity=(0.10, 0.40),
-            p=0.30,
-        ))
-
-    # JPEG compression artifacts — common in onboard streaming video
-    if trial.suggest_categorical("aug_use_compression", [True, False]):
-        transforms.append(A.ImageCompression(quality_range=(50, 90), p=0.25))
-
-    # ── 5. Maritime weather ──────────────────────────────────────────────────
-
-    # Shadow — partial cloud cover or superstructure shadow across the deck
-    if trial.suggest_categorical("aug_use_shadow", [True, False]):
-        transforms.append(A.RandomShadow(p=0.35))
-
-    # Fog — morning sea mist, heavy spray, reduced visibility
-    if trial.suggest_categorical("aug_use_fog", [True, False]):
-        fog_coef = trial.suggest_float("aug_fog_coef_max", 0.10, 0.35)
-        transforms.append(A.RandomFog(fog_coef_range=(0.05, fog_coef), p=0.30))
-
-    # Rain — sea spray, precipitation  (drop_length kept short for spray effect)
-    if trial.suggest_categorical("aug_use_rain", [True, False]):
-        transforms.append(A.RandomRain(
-            slant_range=(-10, 10),
-            drop_length=8,
-            drop_width=1,
-            brightness_coefficient=0.9,
-            p=0.25,
-        ))
-
-    # Sun flare — direct sun reflection on water surface (extremely common)
-    if trial.suggest_categorical("aug_use_sunflare", [True, False]):
-        transforms.append(A.RandomSunFlare(
-            flare_roi=(0.0, 0.0, 1.0, 0.5),   # upper half only (sky/horizon)
-            src_radius=100,
-            p=0.20,
-        ))
-
-    # ── 6. Occlusion ─────────────────────────────────────────────────────────
-
-    # Coarse dropout — wave crests / spray partially occlude distant targets
-    if trial.suggest_categorical("aug_use_dropout", [True, False]):
-        n_holes = trial.suggest_int("aug_dropout_holes", 1, 10)
-        transforms.append(A.CoarseDropout(
-            num_holes_range=(1, n_holes),
-            hole_height_range=(16, 48),
-            hole_width_range=(16, 48),
-            fill=0,
-            p=0.30,
-        ))
-
-    return A.Compose(
-        transforms,
-        bbox_params=A.BboxParams(
-            format="coco",
-            label_fields=["category_ids"],
-            min_area=50.0,
-            min_visibility=0.1,
-        ),
-    )
-
 
 def safe_undo() -> None:
     """Remove augmented images and restore the backup annotation file.
@@ -388,6 +241,8 @@ def objective(
     # ── Sample augmentation ───────────────────────────────────────────────────
     # 2,102 training images is small — up to 3 copies (4× dataset) is reasonable
     aug_copies = 0 if args.smoke else trial.suggest_int("aug_copies", 0, 3)
+    aug_policy = ("none" if args.smoke
+                  else trial.suggest_categorical("aug_policy", list(AUG_POLICIES)))
 
     logger.info("")
     logger.info("=" * 64)
@@ -395,7 +250,7 @@ def objective(
     logger.info(f"  lr={lr:.2e}  lr_encoder={lr_encoder:.2e}  wd={weight_decay:.2e}")
     logger.info(f"  resolution={resolution}  batch={batch_size}  "
                 f"grad_clip={grad_clip_max_norm:.3f}  model={model_variant}")
-    logger.info(f"  aug_copies={aug_copies}")
+    logger.info(f"  aug_copies={aug_copies}  aug_policy={aug_policy}")
     logger.info("=" * 64)
 
     t_trial_start = time.time()
@@ -413,8 +268,8 @@ def objective(
     # ── Apply new augmentation ────────────────────────────────────────────────
     t_aug_start = time.time()
     if aug_copies > 0:
-        pipeline = build_aug_pipeline(trial)
-        logger.info(f"Applying augmentation ({aug_copies} cop{'y' if aug_copies == 1 else 'ies'} per image) …")
+        pipeline = get_maritime_augmentations(aug_policy)
+        logger.info(f"Applying augmentation ({aug_copies} cop{'y' if aug_copies == 1 else 'ies'} per image, policy={aug_policy}) …")
         n_imgs, n_anns = apply_augmentation(pipeline, copies=aug_copies, seed=4)
         aug_elapsed = time.time() - t_aug_start
         logger.info(f"  +{n_imgs:,} images  +{n_anns:,} annotations  ({aug_elapsed:.0f}s)")
