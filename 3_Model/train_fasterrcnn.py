@@ -43,21 +43,19 @@ _HERE     = Path(__file__).parent
 DATA_ROOT = _HERE / "../Data/lars_processed"
 
 DEFAULTS = dict(
-    # Defaults mirror the best Optuna trial: fasterrcnn/optuna/trial_002
-    # (val/mAP_50_95 = 0.2604). trial_002 used a heavy multi-knob aug pipeline
-    # (motion blur + brightness/HSV + CLAHE + gamma + downscale + sunflare);
-    # the closest single policy is light_color, so that is the --aug-policy
-    # default — color components match, blur / gamma / downscale / sunflare
-    # are not reproduced. Anchors stay as the flat list (subsampled to one
-    # per FPN level) so the pretrained RPN head is preserved.
+    # Defaults mirror the best Optuna trial by mAP@50: fasterrcnn/optuna/trial_006
+    # (val/mAP_50 = 0.4527; val/mAP_50_95 = 0.2529). trial_006 ran with no
+    # augmentation (aug_enabled=False), so --aug-policy default is "none".
+    # Anchors stay as the flat list (subsampled to one per FPN level) so the
+    # pretrained RPN head is preserved.
     epochs                   = 25,      # matches Optuna trial budget
-    batch_size               = 16,      # trial_002 used 16
-    lr                       = 2.39e-3, # trial_002 best HP
-    lr_backbone              = 1.42e-4, # trial_002 (= lr * lr_backbone_ratio=0.0595)
-    momentum                 = 0.95,    # trial_002 best HP
-    weight_decay             = 2.07e-5, # trial_002 best HP
-    step_size                = 20,      # trial_002 best HP
-    gamma                    = 0.2,     # trial_002 best HP
+    batch_size               = 8,       # trial_006 best HP
+    lr                       = 3.37e-3, # trial_006 best HP
+    lr_backbone              = 7.85e-4, # trial_006 (= lr * lr_backbone_ratio=0.233)
+    momentum                 = 0.9,     # trial_006 best HP
+    weight_decay             = 2.01e-5, # trial_006 best HP
+    step_size                = 20,      # trial_006 best HP
+    gamma                    = 0.05,    # trial_006 best HP (aggressive LR decay)
     checkpoint_interval      = 5,
     early_stopping_patience  = 7,       # tuned to val-mAP noise envelope
     early_stopping_min_delta = 0.005,
@@ -369,8 +367,9 @@ def parse_args():
     p.add_argument("--oversample", choices=["off", "rfs"], default="off",
                    help="Class-balanced oversampling. rfs = LVIS Repeat Factor "
                         "Sampling with t=0.1 (Float ~3.3x, common classes 1x).")
-    p.add_argument("--aug-policy", choices=list(AUG_POLICIES), default="light_color",
-                   help="Online augmentation policy (default matches Optuna trial_000).")
+    p.add_argument("--aug-policy", choices=list(AUG_POLICIES), default="none",
+                   help="Online augmentation policy. Default 'none' mirrors "
+                        "trial_006 which had aug_enabled=False.")
     return p.parse_args()
 
 
@@ -545,6 +544,7 @@ def main():
 
         # ── Validate ───────────────────────────────────────────────────────────
         val_metrics = evaluate(model, val_loader, device)
+        map50       = val_metrics["val/mAP_50"]
         map5095     = val_metrics["val/mAP_50_95"]
 
         scheduler.step()
@@ -553,8 +553,8 @@ def main():
         logger.info(
             f"Epoch {epoch:3d}/{args.epochs}  "
             f"loss={avg_loss:.4f}  "
+            f"mAP@.5={map50:.4f}  "
             f"mAP@.5:.95={map5095:.4f}  "
-            f"mAP@.5={val_metrics['val/mAP_50']:.4f}  "
             f"({elapsed / 60:.1f} min elapsed)"
         )
 
@@ -563,7 +563,7 @@ def main():
                 "epoch":         epoch,
                 "train/loss":    round(avg_loss, 6),
                 "val/mAP_50_95": round(map5095, 6),
-                "val/mAP_50":    round(val_metrics["val/mAP_50"], 6),
+                "val/mAP_50":    round(map50, 6),
                 "val/mAP_75":    round(val_metrics["val/mAP_75"], 6),
             })
 
@@ -571,11 +571,12 @@ def main():
             torch.save(model.state_dict(),
                        output_dir / f"checkpoint_epoch{epoch:03d}.pth")
 
-        if map5095 > best_map + DEFAULTS["early_stopping_min_delta"]:
-            best_map   = map5095
+        # Best-checkpoint + early-stopping use mAP@50.
+        if map50 > best_map + DEFAULTS["early_stopping_min_delta"]:
+            best_map   = map50
             no_improve = 0
             torch.save(model.state_dict(), output_dir / "checkpoint_best.pth")
-            logger.info(f"  → New best mAP: {best_map:.4f} — checkpoint saved")
+            logger.info(f"  → New best mAP@50: {best_map:.4f} — checkpoint saved")
         else:
             no_improve += 1
 
@@ -590,7 +591,7 @@ def main():
     logger.info("=" * 60)
     logger.info("Training complete.")
     logger.info(f"Training time   : {h:02d}:{m:02d}:{s:02d}  ({total_time / 60:.1f} min)")
-    logger.info(f"Best val mAP    : {best_map:.4f}")
+    logger.info(f"Best val mAP@50 : {best_map:.4f}")
     logger.info(f"Artefacts saved : {output_dir}")
     logger.info("=" * 60)
 

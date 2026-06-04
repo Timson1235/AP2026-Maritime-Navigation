@@ -8,7 +8,7 @@ Each trial:
                                 batch_size, step_size, gamma, model_variant)
   2. Samples an online augmentation pipeline (albumentations, applied per epoch)
   3. Trains Faster R-CNN for --epochs epochs with early stopping
-  4. Reads best val/mAP_50_95 from metrics.csv and reports it to Optuna
+  4. Reads best val/mAP_50 from metrics.csv and reports it to Optuna
   5. After all trials: saves trials_summary.csv
 
 Augmentation is applied online (every epoch sees different random transforms),
@@ -168,15 +168,15 @@ class AugLARSDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 def read_best_map(metrics_csv: Path) -> float | None:
-    """Return best val/mAP_50_95 from a metrics.csv, or None on failure."""
+    """Return best val/mAP_50 from a metrics.csv, or None on failure."""
     if not metrics_csv.exists():
         return None
     try:
         df     = pd.read_csv(metrics_csv)
-        val_df = df.dropna(subset=["val/mAP_50_95"])
+        val_df = df.dropna(subset=["val/mAP_50"])
         if val_df.empty:
             return None
-        return float(val_df["val/mAP_50_95"].max())
+        return float(val_df["val/mAP_50"].max())
     except Exception:
         return None
 
@@ -320,14 +320,15 @@ def objective(
             avg_loss = total_loss / len(train_loader)
 
             val_metrics = evaluate(model, val_loader, device)
+            map50       = val_metrics["val/mAP_50"]
             map5095     = val_metrics["val/mAP_50_95"]
             scheduler.step()
 
             logger.info(
                 f"  Epoch {epoch:2d}/{args.epochs}  "
                 f"loss={avg_loss:.4f}  "
-                f"mAP@.5:.95={map5095:.4f}  "
-                f"mAP@.5={val_metrics['val/mAP_50']:.4f}"
+                f"mAP@.5={map50:.4f}  "
+                f"mAP@.5:.95={map5095:.4f}"
             )
 
             with open(metrics_path, "a", newline="") as f:
@@ -335,12 +336,13 @@ def objective(
                     "epoch":         epoch,
                     "train/loss":    round(avg_loss, 6),
                     "val/mAP_50_95": round(map5095, 6),
-                    "val/mAP_50":    round(val_metrics["val/mAP_50"], 6),
+                    "val/mAP_50":    round(map50, 6),
                     "val/mAP_75":    round(val_metrics["val/mAP_75"], 6),
                 })
 
-            if map5095 > best_map + EARLY_STOPPING_MIN_DELTA:
-                best_map   = map5095
+            # Optimise mAP@50 (early stop + best-checkpoint + Optuna objective).
+            if map50 > best_map + EARLY_STOPPING_MIN_DELTA:
+                best_map   = map50
                 no_improve = 0
                 torch.save(model.state_dict(), trial_dir / "checkpoint_best.pth")
             else:
@@ -364,7 +366,7 @@ def objective(
     logger.info(f"  Training time : {th:02d}:{tm:02d}:{ts:02d}  ({train_elapsed/60:.1f} min)")
 
     best_map = read_best_map(metrics_path) or best_map
-    logger.info(f"Trial {trial.number} best val/mAP_50_95 = {best_map:.4f}  "
+    logger.info(f"Trial {trial.number} best val/mAP_50 = {best_map:.4f}  "
                 f"(total: {trial_elapsed/60:.1f} min)")
     return best_map
 
@@ -435,7 +437,7 @@ def print_summary(
 
     logger.info("")
     logger.info("=" * 64)
-    logger.info("SEARCH COMPLETE — results ranked by val/mAP_50_95")
+    logger.info("SEARCH COMPLETE — results ranked by val/mAP_50")
     logger.info("=" * 64)
 
     rows = sorted(

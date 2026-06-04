@@ -47,19 +47,21 @@ DATA_ROOT = _HERE / "../Data/lars_processed"
 # Default hyperparameters
 # ---------------------------------------------------------------------------
 DEFAULTS = dict(
-    # Mirror the Optuna best trial: rfdetr_relabeled_lb / trial_004
-    # (val/mAP_50_95 = 0.379). trial_004 used aug_copies=2 with a heavy
-    # multi-knob aug pipeline; closest single policy is
-    # sensor_noise_and_occlusion, so that is the --aug-policy default.
+    # Mirror the best Optuna trial by mAP@50: rfdetr_relabeled_lb / trial_000
+    # (val/mAP_50 = 0.5855; val/mAP_50_95 = 0.3656). trial_000 used
+    # aug_copies=3 with a heavy multi-knob aug profile (flip + perspective +
+    # brightness/HSV + CLAHE + equalize + downscale + gaussian blur + shadow +
+    # rain + dropout). Closest single policy is light_color (color components
+    # match cleanly); perspective / weather / dropout are not reproduced.
     epochs               = 100,
-    batch_size           = 4,
-    grad_accum_steps     = 4,       # effective batch = 4 x 4 = 16 (trial_004)
-    lr                   = 1.21e-4, # trial_004 best HP
-    lr_encoder           = 2.81e-5, # trial_004 best HP
-    resolution           = 784,     # base: multiple of 56 (784=56x14); large: multiple of 32 (e.g. 768)
-    weight_decay         = 1.81e-5, # trial_004 best HP
-    grad_clip_max_norm   = 0.083,   # trial_004 best HP
-    aug_copies           = 2,       # trial_004 best HP (used when --aug-policy != none)
+    batch_size           = 24,      # trial_000's per-step batch
+    grad_accum_steps     = 4,       # Optuna script fixed grad_accum=4 -> effective batch = 24 x 4 = 96
+    lr                   = 4.39e-4, # trial_000 best HP
+    lr_encoder           = 5.30e-5, # trial_000 best HP (= lr * lr_enc_ratio=0.121)
+    resolution           = 672,     # trial_000 best HP
+    weight_decay         = 4.49e-4, # trial_000 best HP
+    grad_clip_max_norm   = 0.259,   # trial_000 best HP
+    aug_copies           = 3,       # trial_000 best HP (used when --aug-policy != none)
     checkpoint_interval  = 5,
     early_stopping_patience  = 10,
     early_stopping_min_delta = 0.001,
@@ -176,9 +178,10 @@ def parse_args():
                    help="Override dataset root (default: Data/lars_processed). "
                         "Pass e.g. ../Data/lars_processed to use a different split.")
     p.add_argument("--aug-policy", choices=list(AUG_POLICIES),
-                   default="sensor_noise_and_occlusion",
+                   default="light_color",
                    help="Offline augmentation policy applied via aug_copies "
-                        "image duplicates (default mirrors trial_004's heavy mix).")
+                        "image duplicates (default = closest single-policy "
+                        "match to trial_000's heavy multi-knob aug).")
     p.add_argument("--aug-copies", type=int, default=DEFAULTS["aug_copies"],
                    help="Augmented copies per training image (0 disables augmentation).")
     p.add_argument("--oversample", choices=["off", "rfs"], default="off",
@@ -381,13 +384,13 @@ def main():
         try:
             import pandas as pd
             df     = pd.read_csv(metrics_csv)
-            val_df = df.dropna(subset=["val/mAP_50_95"])
+            val_df = df.dropna(subset=["val/mAP_50"])
             if not val_df.empty:
-                best = val_df.loc[val_df["val/mAP_50_95"].idxmax()]
+                best = val_df.loc[val_df["val/mAP_50"].idxmax()]
                 logger.info(
                     f"Best epoch {int(best['epoch'])}: "
-                    f"mAP@.50:.95={best['val/mAP_50_95']:.4f}  "
                     f"mAP@.50={best['val/mAP_50']:.4f}  "
+                    f"mAP@.50:.95={best['val/mAP_50_95']:.4f}  "
                     f"F1={best['val/F1']:.4f}"
                 )
         except Exception as exc:

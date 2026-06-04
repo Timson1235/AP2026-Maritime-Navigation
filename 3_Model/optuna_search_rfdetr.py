@@ -6,7 +6,7 @@ Each trial:
   2. Samples augmentation config (pipeline transforms + copies-per-image)
   3. Undoes any previous offline augmentation, applies the new config
   4. Trains RF-DETR for --epochs epochs with early stopping
-  5. Reads best val/mAP_50_95 from metrics.csv and reports it to Optuna
+  5. Reads best val/mAP_50 from metrics.csv and reports it to Optuna
   6. After all trials: restores original dataset, saves trials_summary.csv
 
 Dataset context:
@@ -196,15 +196,15 @@ def apply_augmentation(pipeline: A.Compose, copies: int, seed: int = 4) -> tuple
 # ---------------------------------------------------------------------------
 
 def read_best_map(metrics_csv: Path) -> float | None:
-    """Return best val/mAP_50_95 from a metrics.csv, or None on failure."""
+    """Return best val/mAP_50 from a metrics.csv, or None on failure."""
     if not metrics_csv.exists():
         return None
     try:
         df     = pd.read_csv(metrics_csv)
-        val_df = df.dropna(subset=["val/mAP_50_95"])
+        val_df = df.dropna(subset=["val/mAP_50"])
         if val_df.empty:
             return None
-        return float(val_df["val/mAP_50_95"].max())
+        return float(val_df["val/mAP_50"].max())
     except Exception:
         return None
 
@@ -325,7 +325,7 @@ def objective(
         logger.warning(f"Trial {trial.number}: no valid mAP found in metrics.csv.")
         raise optuna.exceptions.TrialPruned()
 
-    logger.info(f"Trial {trial.number} best val/mAP_50_95 = {best_map:.4f}  "
+    logger.info(f"Trial {trial.number} best val/mAP_50 = {best_map:.4f}  "
                 f"(trial total: {trial_elapsed/60:.1f} min)")
     return best_map
 
@@ -395,7 +395,7 @@ def print_summary(
 
     logger.info("")
     logger.info("=" * 64)
-    logger.info("SEARCH COMPLETE — results ranked by val/mAP_50_95")
+    logger.info("SEARCH COMPLETE — results ranked by val/mAP_50")
     logger.info("=" * 64)
 
     rows = sorted(
