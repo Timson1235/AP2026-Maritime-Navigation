@@ -46,7 +46,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import torchvision.transforms.functional as TF
 from PIL import Image
 import albumentations as A
@@ -162,6 +162,49 @@ class AugLARSDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
+# Repeat Factor Sampling  (LVIS-style class-balanced oversampling)
+# ---------------------------------------------------------------------------
+
+def compute_repeat_factors(ds: "AugLARSDataset",
+                           t: float    = 0.1,
+                           max_r: float = 10.0) -> list[float]:
+    """
+    Per-image repeat factor for class-balanced sampling
+    (LVIS Repeat Factor Sampling, adapted to LARS frequencies).
+
+      f_c = (# train images containing category c) / N
+      r_c = max(1, sqrt(t / f_c))            (capped at max_r)
+      r_i = max over c in image i of r_c
+
+    LVIS uses t=1e-3 because their tail goes <0.01%. LARS's rarest
+    class (Float) is at 0.9%, so t=0.1 is calibrated to give it a
+    meaningful boost while leaving the majority classes untouched:
+      Float        (0.9%)  → 3.3×
+      Animal       (3.2%)  → 1.8×
+      Paddle board (4.0%)  → 1.6×
+      Swimmer      (4.8%)  → 1.4×
+      Row boats    (9.1%)  → 1.0× (just below)
+      Buoy / Other / Boat  → 1.0×  (above t)
+    Mean repeat factor ≈ 1.09 → effective epoch size grows ~9%.
+    """
+    from collections import defaultdict
+    N = len(ds.imgs)
+    cat_img_count: dict[int, int] = defaultdict(int)
+    per_img_cats:  list[set[int]] = []
+
+    for img in ds.imgs:
+        cats = {a["category_id"] for a in ds.anns_by_img.get(img["id"], [])}
+        per_img_cats.append(cats)
+        for c in cats:
+            cat_img_count[c] += 1
+
+    r_c = {c: min(max_r, max(1.0, (t / (n / N)) ** 0.5))
+           for c, n in cat_img_count.items()}
+
+    return [max((r_c[c] for c in cats), default=1.0) for cats in per_img_cats]
+
+
+# ---------------------------------------------------------------------------
 # Metrics helper
 # ---------------------------------------------------------------------------
 
@@ -219,7 +262,7 @@ def objective(
     logger.info(f"Trial {trial.number:3d}  →  {trial_dir.name}")
     logger.info(f"  lr={lr:.2e}  lr_backbone={lr_backbone:.2e}  wd={weight_decay:.2e}")
     logger.info(f"  momentum={momentum}  batch={batch_size}  model=base")
-    logger.info(f"  step_size={step_size}  gamma={gamma}  aug_policy={aug_policy}")
+    logger.info(f"  step_size={step_size}  gamma={gamma}  aug_policy={aug_policy}  oversample={args.oversample}")
     logger.info("=" * 64)
 
     t_trial_start = time.time()
@@ -240,11 +283,25 @@ def objective(
     train_ds  = AugLARSDataset(data_root, "train", pipeline=aug_pipeline)
     val_ds    = AugLARSDataset(data_root, "valid",  pipeline=None)
 
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=NUM_WORKERS, collate_fn=collate_fn,
-        pin_memory=device.type == "cuda",
-    )
+    if args.oversample == "rfs":
+        weights = compute_repeat_factors(train_ds, t=0.1)
+        sampler = WeightedRandomSampler(
+            weights, num_samples=len(train_ds), replacement=True,
+        )
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, sampler=sampler,
+            num_workers=NUM_WORKERS, collate_fn=collate_fn,
+            pin_memory=device.type == "cuda",
+        )
+        trial.set_user_attr("oversample", "rfs")
+        trial.set_user_attr("oversample_max_r", round(max(weights), 2))
+    else:
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True,
+            num_workers=NUM_WORKERS, collate_fn=collate_fn,
+            pin_memory=device.type == "cuda",
+        )
+        trial.set_user_attr("oversample", "off")
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False,
         num_workers=NUM_WORKERS, collate_fn=collate_fn,
@@ -381,6 +438,10 @@ def parse_args() -> argparse.Namespace:
                    help="Print sampled hyperparameters without training")
     p.add_argument("--smoke",      action="store_true",
                    help="Smoke-test: fixes batch_size=8, base model, no aug, 2 epochs")
+    p.add_argument("--oversample", choices=["off", "rfs"], default="off",
+                   help="Class-balanced oversampling (study-wide, not searched). "
+                        "rfs = LVIS Repeat Factor Sampling with t=0.1 "
+                        "(Float ~3.3x, common classes 1x).")
     return p.parse_args()
 
 
@@ -512,6 +573,7 @@ def main() -> None:
     logger.info(f"Trials      : {args.n_trials}  ({existing} already in DB)")
     logger.info(f"Epochs/trial: {args.epochs}")
     logger.info(f"Output root : {study_dir}")
+    logger.info(f"Oversample  : {args.oversample}")
     if args.dry_run:
         logger.info("DRY RUN — no training will occur")
     logger.info("=" * 64)
