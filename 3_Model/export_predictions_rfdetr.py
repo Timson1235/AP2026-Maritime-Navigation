@@ -24,7 +24,7 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
-from rfdetr import RFDETRBase
+from rfdetr import RFDETRBase, RFDETRLarge
 
 
 def parse_args():
@@ -40,6 +40,8 @@ def parse_args():
                         "(default: 0.0, keep all; the evaluation notebook re-filters)")
     p.add_argument("--resolution", type=int, default=784,
                    help="Model input resolution (must match training; trial_004 was trained at 784)")
+    p.add_argument("--model", choices=["base", "large"], default="base",
+                   help="RF-DETR variant the checkpoint was trained with (default: base)")
     p.add_argument("--out", default=None,
                    help="Output JSON path. Defaults to <checkpoint_dir>/predictions_<split>.json")
     return p.parse_args()
@@ -77,7 +79,8 @@ def main():
     print(f"Output      : {out_path}")
 
     # ── Load model ──────────────────────────────────────────────────────────
-    model = RFDETRBase(
+    ModelCls = RFDETRLarge if args.model == "large" else RFDETRBase
+    model = ModelCls(
         resolution=args.resolution,
         num_classes=N_CLASSES,
         pretrain_weights=str(checkpoint),
