@@ -186,3 +186,8 @@ runs/
 *.pt
 *.zip
 *.mp4
+
+# Superseded analysis notebooks kept locally for reference
+3_Model/model_definition_evaluation.ipynb
+3_Model/rfdetr_pretrained.ipynb
+3_Model/inference_test.ipynb
