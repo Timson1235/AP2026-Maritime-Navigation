@@ -5,9 +5,12 @@ Fine-tune YOLOv8 on the LARS maritime dataset.
 
 Model choices (--model):
   n  — YOLOv8 Nano   (3.2 M params, fastest)
-  s  — YOLOv8 Small  (11 M params) [default]
-  m  — YOLOv8 Medium (25 M params, best accuracy / speed trade-off)
+  s  — YOLOv8 Small  (11 M params)
+  m  — YOLOv8 Medium (25 M params, best accuracy / speed trade-off) [default]
   l  — YOLOv8 Large  (43 M params)
+
+Defaults reproduce the YOLOv8m run from train_yolo.ipynb
+(exp7_yolov8m_ep100_img1024_b4): AdamW, imgsz 1024, batch 4, 100 epochs.
 
 On first run the COCO annotations are converted to YOLO txt format and
 cached in Data/lars_yolo/ (images are symlinked, not copied).
@@ -42,17 +45,21 @@ YOLO_ROOT = (_HERE / "../Data/lars_yolo").resolve()
 
 DEFAULTS = dict(
     epochs                   = 100,
-    batch_size               = 8,
-    imgsz                    = 800,
+    batch_size               = 4,
+    imgsz                    = 1024,
+    optimizer                = "AdamW",
     lr0                      = 1e-3,
     lrf                      = 0.01,    # final lr = lr0 * lrf
     momentum                 = 0.937,
-    weight_decay             = 5e-4,
+    weight_decay             = 1e-4,
     warmup_epochs            = 3,
     box                      = 7.5,
     cls                      = 0.5,
     patience                 = 15,      # early stopping patience (0 = off)
-    workers                  = 4,
+    workers                  = 0,
+    device                   = "0",     # GPU index, or "cpu"
+    deterministic            = True,
+    pretrained               = True,
     checkpoint_interval      = -1,      # -1 = only best + last
 )
 
@@ -197,7 +204,7 @@ def parse_args():
         description="Fine-tune YOLOv8 on the LARS maritime dataset",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--model",      choices=["n", "s", "m", "l"], default="s",
+    p.add_argument("--model",      choices=["n", "s", "m", "l"], default="m",
                    help="YOLOv8 variant: n=Nano  s=Small  m=Medium  l=Large")
     p.add_argument("--output-dir", default=str(_HERE / "../runs/yolo/baseline"),
                    help="Directory for weights, metrics.csv, and training.log")
@@ -208,11 +215,16 @@ def parse_args():
     p.add_argument("--epochs",     type=int,   default=DEFAULTS["epochs"])
     p.add_argument("--batch",      type=int,   default=DEFAULTS["batch_size"])
     p.add_argument("--imgsz",      type=int,   default=DEFAULTS["imgsz"])
+    p.add_argument("--optimizer",  default=DEFAULTS["optimizer"],
+                   help="Optimizer (e.g. AdamW, SGD, auto)")
     p.add_argument("--lr0",        type=float, default=DEFAULTS["lr0"])
     p.add_argument("--lrf",        type=float, default=DEFAULTS["lrf"])
+    p.add_argument("--weight-decay", type=float, default=DEFAULTS["weight_decay"])
     p.add_argument("--patience",   type=int,   default=DEFAULTS["patience"],
                    help="Early stopping patience (0 = disabled)")
     p.add_argument("--workers",    type=int,   default=DEFAULTS["workers"])
+    p.add_argument("--device",     default=DEFAULTS["device"],
+                   help="CUDA device index (e.g. 0), '0,1' for multi-GPU, or 'cpu'")
     p.add_argument("--resume",     action="store_true",
                    help="Resume from last.pt in --output-dir")
     p.add_argument("--no-plots",   action="store_true",
@@ -284,7 +296,8 @@ def main():
 
     logger.info(f"Output dir   : {output_dir}")
     logger.info(f"Epochs       : {args.epochs}  |  Batch: {args.batch}  |  imgsz: {args.imgsz}")
-    logger.info(f"lr0={args.lr0}  lrf={args.lrf}  patience={args.patience}")
+    logger.info(f"Optimizer    : {args.optimizer}  |  device: {args.device}")
+    logger.info(f"lr0={args.lr0}  lrf={args.lrf}  weight_decay={args.weight_decay}  patience={args.patience}")
     logger.info("Starting training …")
 
     t_start = time.time()
@@ -293,15 +306,19 @@ def main():
         epochs           = args.epochs,
         batch            = args.batch,
         imgsz            = args.imgsz,
+        optimizer        = args.optimizer,
         lr0              = args.lr0,
         lrf              = args.lrf,
         momentum         = DEFAULTS["momentum"],
-        weight_decay     = DEFAULTS["weight_decay"],
+        weight_decay     = args.weight_decay,
         warmup_epochs    = DEFAULTS["warmup_epochs"],
         box              = DEFAULTS["box"],
         cls              = DEFAULTS["cls"],
         patience         = args.patience,
         workers          = args.workers,
+        device           = args.device,
+        deterministic    = DEFAULTS["deterministic"],
+        pretrained       = DEFAULTS["pretrained"],
         seed             = 4,
         project          = str(output_dir.parent),
         name             = output_dir.name,
