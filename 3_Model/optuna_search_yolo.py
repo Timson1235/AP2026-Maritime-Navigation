@@ -13,6 +13,9 @@ Each trial:
   4. Reads best val/mAP_50_95 from Ultralytics results.csv and reports to Optuna
   5. After all trials: saves trials_summary.csv
 
+Optimizer is fixed to AdamW (--optimizer) and pretrained/deterministic are on,
+mirroring the project's YOLOv8m training setup.
+
 Why 50 epochs by default?
   YOLOv8s trains ~1 min/epoch on an A40 at imgsz=800.  50 epochs ≈ 50 min
   per trial gives Optuna a reliable signal for 10 trials in ~8 h.
@@ -127,6 +130,7 @@ def objective(
             epochs        = args.epochs,
             batch         = batch_size,
             imgsz         = imgsz,
+            optimizer     = args.optimizer,
             lr0           = lr0,
             lrf           = lrf,
             momentum      = momentum,
@@ -145,7 +149,10 @@ def objective(
             mixup         = mixup,
             patience      = EARLY_STOPPING_PATIENCE,
             seed          = 4,
-            workers       = 4,
+            workers       = 0,
+            device        = args.device,
+            deterministic = True,
+            pretrained    = True,
             project       = str(trial_dir.parent),
             name          = trial_dir.name,
             exist_ok      = True,
@@ -198,6 +205,10 @@ def parse_args() -> argparse.Namespace:
                    help="Override COCO dataset root (default: Data/lars_processed)")
     p.add_argument("--yolo-data-dir", type=str, default=None,
                    help="Override YOLO-format dataset dir (default: Data/lars_yolo)")
+    p.add_argument("--optimizer",  type=str, default="AdamW",
+                   help="Optimizer fixed across trials (e.g. AdamW, SGD, auto)")
+    p.add_argument("--device",     type=str, default="0",
+                   help="CUDA device index (e.g. 0), '0,1' for multi-GPU, or 'cpu'")
     p.add_argument("--sampler",    choices=["tpe", "random"], default="tpe",
                    help="Optuna sampler: tpe (Bayesian, recommended) or random")
     p.add_argument("--timeout",    type=int, default=None,
@@ -340,6 +351,7 @@ def main() -> None:
     logger.info(f"Study       : {args.study_name}")
     logger.info(f"Storage     : {storage}")
     logger.info(f"Sampler     : {args.sampler.upper()}")
+    logger.info(f"Optimizer   : {args.optimizer}  |  device: {args.device}")
     logger.info(f"Trials      : {args.n_trials}  ({existing} already in DB)")
     logger.info(f"Epochs/trial: {args.epochs}")
     logger.info(f"Output root : {study_dir}")
