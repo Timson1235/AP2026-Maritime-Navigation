@@ -302,7 +302,7 @@ def main() -> None:
     args      = parse_args()
     study_dir = Path(args.study_dir)
 
-    if args.smoke:
+    if args.smoke and "--epochs" not in sys.argv:
         args.epochs = 2
 
     coco_root = Path(args.data_root).resolve()    if args.data_root    else DATA_ROOT
