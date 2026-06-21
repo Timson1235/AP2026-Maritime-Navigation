@@ -144,6 +144,18 @@ Data/lars_relabeled/valid/*
 !Data/lars_relabeled/test
 Data/lars_relabeled/test/*
 !Data/lars_relabeled/test/*.json
+# lars_processed: track only the active COCO annotation JSONs (never images)
+!Data/lars_processed
+Data/lars_processed/*
+!Data/lars_processed/train
+Data/lars_processed/train/*
+!Data/lars_processed/train/_annotations.coco.json
+!Data/lars_processed/valid
+Data/lars_processed/valid/*
+!Data/lars_processed/valid/_annotations.coco.json
+!Data/lars_processed/test
+Data/lars_processed/test/*
+!Data/lars_processed/test/_annotations.coco.json
 
 # Spyder project settings
 .spyderproject
